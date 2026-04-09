@@ -1067,7 +1067,21 @@ void kvm_get_kvm(struct kvm *kvm);
 bool kvm_get_kvm_safe(struct kvm *kvm);
 void kvm_put_kvm(struct kvm *kvm);
 bool file_is_kvm(struct file *file);
+bool file_is_kvm_vcpu(struct file *file);
 void kvm_put_kvm_no_destroy(struct kvm *kvm);
+unsigned long kvm_arch_superfork_vm_type(struct kvm *kvm);
+unsigned long kvm_superfork_get_vm_type(struct kvm *kvm);
+
+int kvm_superfork_create_vm_for_mm(struct mm_struct *mm, unsigned long type,
+				   struct file **out_vm_file,
+				   struct kvm **out_kvm);
+int kvm_superfork_create_vcpu(struct kvm *kvm, unsigned int vcpu_id,
+			      struct file **out_vcpu_file,
+			      struct kvm_vcpu **out_vcpu);
+int kvm_superfork_set_memslot(struct kvm *kvm,
+			      const struct kvm_userspace_memory_region2 *mem);
+int kvm_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
+				  struct kvm_vcpu *src);
 
 static inline struct kvm_memslots *__kvm_memslots(struct kvm *kvm, int as_id)
 {

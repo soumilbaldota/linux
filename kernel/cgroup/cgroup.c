@@ -6970,6 +6970,149 @@ void cgroup_post_fork(struct task_struct *child,
 
 	cgroup_css_set_put_fork(kargs);
 }
+/* ========== Cgroup Attachment ========== */
+
+/**
+ * superfork_cgroup_attach_task - attach a superfork'ed task to source task's cgroup
+ * @new_task: the newly cloned task
+ * @src_task: the source task whose cgroup we want to inherit
+ *
+ * This is a simplified cgroup attachment for superfork. It attaches @new_task
+ * to the same css_set as @src_task while mirroring the normal can_fork/fork
+ * callback lifecycle for controller accounting.
+ * Unlike normal fork, superfork clones tasks from a different process
+ * hierarchy, so we need to copy the source task's cgroup membership rather
+ * than inherit from current.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int superfork_cgroup_attach_task(struct task_struct *new_task,
+					struct task_struct *src_task)
+{
+	struct cgroup_subsys *ss;
+	struct css_set *src_cset;
+	struct kernel_clone_args kargs = { };
+	unsigned long cgrp_flags = 0;
+	int i, j;
+	int ret = 0;
+
+	/*
+	 * Keep lock ordering aligned with CLONE_INTO_CGROUP fork path:
+	 * cgroup_mutex -> cgroup_threadgroup_rwsem -> css_set_lock.
+	 * This satisfies cpuset can_fork() requirements when attaching tasks
+	 * into a css_set that differs from current.
+	 */
+	cgroup_lock();
+	cgroup_threadgroup_change_begin(current);
+	spin_lock_irq(&css_set_lock);
+
+	/* Get the source task's css_set */
+	src_cset = task_css_set(src_task);
+	if (!src_cset) {
+		ret = -EINVAL;
+		goto out_unlock_end;
+	}
+
+	/*
+	 * This reference is transferred to @new_task on success and released
+	 * from cgroup_free() when the cloned task exits.
+	 */
+	get_css_set(src_cset);
+
+	/* The new task should have an empty cg_list from cgroup_fork() */
+	if (WARN_ON_ONCE(!list_empty(&new_task->cg_list))) {
+		ret = -EBUSY;
+		goto out_put_unlock_end;
+	}
+
+	cgrp_flags = src_cset->dfl_cgrp->flags;
+
+	spin_unlock_irq(&css_set_lock);
+
+	/*
+	 * Mirror regular fork semantics: run can_fork callbacks first so
+	 * controllers (especially pids) can charge resources before attach.
+	 */
+	do_each_subsys_mask(ss, i, have_canfork_callback) {
+		ret = ss->can_fork(new_task, src_cset);
+		if (ret)
+			goto out_revert_canfork;
+	} while_each_subsys_mask();
+
+	/*
+	 * Keep scheduler/cgroup state consistent with regular fork path.
+	 * This sets sched_task_group and class-specific fork bookkeeping
+	 * using the same css_set chosen above.
+	 */
+	kargs.cset = src_cset;
+	ret = sched_cgroup_fork(new_task, &kargs);
+	if (ret)
+		goto out_revert_all_canfork;
+
+	spin_lock_irq(&css_set_lock);
+
+	/* Attach the new task to the source's css_set */
+	src_cset->nr_tasks++;
+	css_set_move_task(new_task, NULL, src_cset, false);
+
+	/*
+	 * Handle frozen cgroup state - if source's cgroup is frozen,
+	 * the new task should also be marked for freezing.
+	 */
+	if (!(new_task->flags & PF_KTHREAD)) {
+		if (unlikely(test_bit(CGRP_FREEZE, &cgrp_flags))) {
+			spin_lock(&new_task->sighand->siglock);
+			WARN_ON_ONCE(new_task->frozen);
+			new_task->jobctl |= JOBCTL_TRAP_FREEZE;
+			spin_unlock(&new_task->sighand->siglock);
+		}
+	}
+
+	spin_unlock_irq(&css_set_lock);
+
+	/*
+	 * Call subsystem fork() callbacks. This must happen after the task
+	 * is linked to the css_set.
+	 */
+	do_each_subsys_mask(ss, i, have_fork_callback) {
+		ss->fork(new_task);
+	} while_each_subsys_mask();
+
+	goto out_end;
+
+out_revert_canfork:
+	for_each_subsys(ss, j) {
+		if (j >= i)
+			break;
+		if (ss->cancel_fork)
+			ss->cancel_fork(new_task, src_cset);
+	}
+	goto out_put_end;
+
+out_revert_all_canfork:
+	for_each_subsys(ss, j) {
+		if (ss->cancel_fork)
+			ss->cancel_fork(new_task, src_cset);
+	}
+
+out_put_end:
+	put_css_set(src_cset);
+
+out_end:
+	cgroup_threadgroup_change_end(current);
+	cgroup_unlock();
+	return ret;
+
+out_put_unlock_end:
+	put_css_set(src_cset);
+
+out_unlock_end:
+	spin_unlock_irq(&css_set_lock);
+	cgroup_threadgroup_change_end(current);
+	cgroup_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(superfork_cgroup_attach_task);
 
 /**
  * cgroup_exit - detach cgroup from exiting task

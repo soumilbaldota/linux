@@ -11,6 +11,10 @@
 #include <uapi/linux/signalfd.h>
 #include <linux/sched/signal.h>
 
+struct file *signalfd_file_create(sigset_t *mask, int flags);
+void signalfd_ctx_sigmask(struct file *file, sigset_t *mask);
+bool signalfd_file_is_signalfd(struct file *file);
+
 #ifdef CONFIG_SIGNALFD
 
 /*
@@ -29,6 +33,7 @@ extern void signalfd_cleanup(struct sighand_struct *sighand);
 static inline void signalfd_notify(struct task_struct *tsk, int sig) { }
 
 static inline void signalfd_cleanup(struct sighand_struct *sighand) { }
+
 
 #endif /* CONFIG_SIGNALFD */
 

@@ -209,6 +209,14 @@ err_unshare_kvm:
 	return ret;
 }
 
+unsigned long kvm_arch_superfork_vm_type(struct kvm *kvm)
+{
+	if (!kvm)
+		return 0;
+
+	return kvm_phys_shift(&kvm->arch.mmu);
+}
+
 vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
 {
 	return VM_FAULT_SIGBUS;

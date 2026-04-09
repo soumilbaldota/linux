@@ -24,6 +24,8 @@
 #include <linux/seq_file.h>
 #include <linux/idr.h>
 #include <linux/uio.h>
+#include <linux/fdtable.h>
+
 
 static DEFINE_IDA(eventfd_ida);
 
@@ -376,6 +378,23 @@ struct eventfd_ctx *eventfd_ctx_fileget(struct file *file)
 }
 EXPORT_SYMBOL_GPL(eventfd_ctx_fileget);
 
+
+u64 eventfd_ctx_count(struct eventfd_ctx *ctx)
+{
+    u64 count;
+    spin_lock_irq(&ctx->wqh.lock);
+    count = ctx->count;
+    spin_unlock_irq(&ctx->wqh.lock);
+    return count;
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_count);
+
+unsigned int eventfd_ctx_flags(struct eventfd_ctx *ctx)
+{
+    return ctx->flags;
+}
+EXPORT_SYMBOL_GPL(eventfd_ctx_flags);
+
 static int do_eventfd(unsigned int count, int flags)
 {
 	struct eventfd_ctx *ctx;
@@ -419,6 +438,23 @@ err:
 	eventfd_free_ctx(ctx);
 	return fd;
 }
+
+
+struct file *eventfd_file_create(u64 count, int flags)
+{
+    struct file *file;
+    int fd;
+
+    fd = do_eventfd(count, flags);
+    if (fd < 0)
+        return ERR_PTR(fd);
+
+    file = fget(fd);
+    close_fd(fd);
+    return file;
+}
+EXPORT_SYMBOL_GPL(eventfd_file_create);
+
 
 SYSCALL_DEFINE2(eventfd2, unsigned int, count, int, flags)
 {

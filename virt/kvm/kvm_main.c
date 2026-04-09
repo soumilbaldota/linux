@@ -24,6 +24,7 @@
 #include <linux/debugfs.h>
 #include <linux/highmem.h>
 #include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/syscore_ops.h>
 #include <linux/cpu.h>
 #include <linux/sched/signal.h>
@@ -1111,7 +1112,8 @@ static inline struct kvm_io_bus *kvm_get_bus_for_destruction(struct kvm *kvm,
 					 !refcount_read(&kvm->users_count));
 }
 
-static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
+static struct kvm *kvm_create_vm(unsigned long type, const char *fdname,
+				 struct mm_struct *mm)
 {
 	struct kvm *kvm = kvm_arch_alloc_vm();
 	struct kvm_memslots *slots;
@@ -1119,10 +1121,14 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 
 	if (!kvm)
 		return ERR_PTR(-ENOMEM);
+	if (!mm) {
+		kvm_arch_free_vm(kvm);
+		return ERR_PTR(-EINVAL);
+	}
 
 	KVM_MMU_LOCK_INIT(kvm);
-	mmgrab(current->mm);
-	kvm->mm = current->mm;
+	mmgrab(mm);
+	kvm->mm = mm;
 	kvm_eventfd_init(kvm);
 	mutex_init(&kvm->lock);
 	mutex_init(&kvm->irq_lock);
@@ -1227,7 +1233,7 @@ out_err_no_debugfs:
 out_no_coalesced_mmio:
 #ifdef CONFIG_KVM_GENERIC_MMU_NOTIFIER
 	if (kvm->mmu_notifier.ops)
-		mmu_notifier_unregister(&kvm->mmu_notifier, current->mm);
+		mmu_notifier_unregister(&kvm->mmu_notifier, kvm->mm);
 #endif
 out_err_no_mmu_notifier:
 	kvm_disable_virtualization();
@@ -1244,7 +1250,7 @@ out_err_no_irq_srcu:
 	cleanup_srcu_struct(&kvm->srcu);
 out_err_no_srcu:
 	kvm_arch_free_vm(kvm);
-	mmdrop(current->mm);
+	mmdrop(mm);
 	return ERR_PTR(r);
 }
 
@@ -5476,6 +5482,152 @@ bool file_is_kvm(struct file *file)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(file_is_kvm);
 
+bool file_is_kvm_vcpu(struct file *file)
+{
+	return file && file->f_op == &kvm_vcpu_fops;
+}
+EXPORT_SYMBOL_GPL(file_is_kvm_vcpu);
+
+unsigned long __weak kvm_arch_superfork_vm_type(struct kvm *kvm)
+{
+	return 0;
+}
+
+unsigned long kvm_superfork_get_vm_type(struct kvm *kvm)
+{
+	if (!kvm)
+		return 0;
+
+	return kvm_arch_superfork_vm_type(kvm);
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_get_vm_type);
+
+int kvm_superfork_create_vm_for_mm(struct mm_struct *mm, unsigned long type,
+				   struct file **out_vm_file,
+				   struct kvm **out_kvm)
+{
+	struct kvm *kvm;
+	struct file *file;
+
+	if (!mm || !out_vm_file || !out_kvm)
+		return -EINVAL;
+
+	kvm = kvm_create_vm(type, "superfork", mm);
+	if (IS_ERR(kvm))
+		return PTR_ERR(kvm);
+
+	file = anon_inode_getfile("kvm-vm", &kvm_vm_fops, kvm, O_RDWR);
+	if (IS_ERR(file)) {
+		kvm_put_kvm(kvm);
+		return PTR_ERR(file);
+	}
+
+	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
+	*out_vm_file = file;
+	*out_kvm = kvm;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_create_vm_for_mm);
+
+int kvm_superfork_create_vcpu(struct kvm *kvm, unsigned int vcpu_id,
+			      struct file **out_vcpu_file,
+			      struct kvm_vcpu **out_vcpu)
+{
+	struct file *file;
+	int fd;
+
+	if (!kvm || !out_vcpu_file || !out_vcpu)
+		return -EINVAL;
+
+	fd = kvm_vm_ioctl_create_vcpu(kvm, vcpu_id);
+	if (fd < 0)
+		return fd;
+
+	file = fget(fd);
+	if (!file) {
+		close_fd(fd);
+		return -EBADF;
+	}
+	close_fd(fd);
+
+	if (!file_is_kvm_vcpu(file)) {
+		fput(file);
+		return -EINVAL;
+	}
+
+	*out_vcpu_file = file;
+	*out_vcpu = file->private_data;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_create_vcpu);
+
+int kvm_superfork_set_memslot(struct kvm *kvm,
+			      const struct kvm_userspace_memory_region2 *mem)
+{
+	int ret;
+
+	if (!kvm || !mem)
+		return -EINVAL;
+
+	mutex_lock(&kvm->slots_lock);
+	ret = kvm_set_memory_region(kvm, mem);
+	mutex_unlock(&kvm->slots_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_set_memslot);
+
+int kvm_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
+				  struct kvm_vcpu *src)
+{
+	struct kvm_regs regs;
+	struct kvm_sregs sregs;
+	struct kvm_fpu fpu;
+	struct kvm_mp_state mp_state;
+	int ret;
+
+	if (!dst || !src)
+		return -EINVAL;
+
+	mutex_lock(&src->mutex);
+	ret = kvm_arch_vcpu_ioctl_get_regs(src, &regs);
+	if (ret)
+		goto out_src;
+
+	ret = kvm_arch_vcpu_ioctl_get_sregs(src, &sregs);
+	if (ret)
+		goto out_src;
+
+	ret = kvm_arch_vcpu_ioctl_get_fpu(src, &fpu);
+	if (ret)
+		goto out_src;
+
+	ret = kvm_arch_vcpu_ioctl_get_mpstate(src, &mp_state);
+	if (ret)
+		goto out_src;
+
+	mutex_lock(&dst->mutex);
+	ret = kvm_arch_vcpu_ioctl_set_regs(dst, &regs);
+	if (ret)
+		goto out_dst;
+
+	ret = kvm_arch_vcpu_ioctl_set_sregs(dst, &sregs);
+	if (ret)
+		goto out_dst;
+
+	ret = kvm_arch_vcpu_ioctl_set_fpu(dst, &fpu);
+	if (ret)
+		goto out_dst;
+
+	ret = kvm_arch_vcpu_ioctl_set_mpstate(dst, &mp_state);
+
+out_dst:
+	mutex_unlock(&dst->mutex);
+out_src:
+	mutex_unlock(&src->mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_copy_vcpu_state);
+
 static int kvm_dev_ioctl_create_vm(unsigned long type)
 {
 	char fdname[ITOA_MAX_LEN + 1];
@@ -5489,7 +5641,7 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 
 	snprintf(fdname, sizeof(fdname), "%d", fd);
 
-	kvm = kvm_create_vm(type, fdname);
+	kvm = kvm_create_vm(type, fdname, current->mm);
 	if (IS_ERR(kvm)) {
 		r = PTR_ERR(kvm);
 		goto put_fd;

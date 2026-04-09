@@ -39,6 +39,9 @@ void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask);
 int eventfd_ctx_remove_wait_queue(struct eventfd_ctx *ctx, wait_queue_entry_t *wait,
 				  __u64 *cnt);
 void eventfd_ctx_do_read(struct eventfd_ctx *ctx, __u64 *cnt);
+u64 eventfd_ctx_count(struct eventfd_ctx *ctx);
+struct file *eventfd_file_create(u64 count, int flags);
+unsigned int eventfd_ctx_flags(struct eventfd_ctx *ctx);
 
 static inline bool eventfd_signal_allowed(void)
 {

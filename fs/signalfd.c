@@ -32,6 +32,7 @@
 #include <linux/syscalls.h>
 #include <linux/proc_fs.h>
 #include <linux/compat.h>
+#include <linux/fdtable.h>
 
 void signalfd_cleanup(struct sighand_struct *sighand)
 {
@@ -302,6 +303,34 @@ static int do_signalfd4(int ufd, sigset_t *mask, int flags)
 
 	return ufd;
 }
+
+struct file *signalfd_file_create(sigset_t *mask, int flags)
+{
+    struct file *file;
+    int fd;
+
+    fd = do_signalfd4(-1, mask, flags);
+    if (fd < 0)
+        return ERR_PTR(fd);
+
+    file = fget(fd);
+    close_fd(fd);
+    return file;
+}
+EXPORT_SYMBOL_GPL(signalfd_file_create);
+
+void signalfd_ctx_sigmask(struct file *file, sigset_t *mask)
+{
+    struct signalfd_ctx *ctx = file->private_data;
+    *mask = ctx->sigmask;
+}
+EXPORT_SYMBOL_GPL(signalfd_ctx_sigmask);
+
+bool signalfd_file_is_signalfd(struct file *file)
+{
+    return file->f_op == &signalfd_fops;
+}
+EXPORT_SYMBOL_GPL(signalfd_file_is_signalfd);
 
 SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		size_t, sizemask, int, flags)
