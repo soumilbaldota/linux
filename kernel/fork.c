@@ -23,6 +23,7 @@
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/ext.h>
+#include <linux/superfork.h>
 #include <linux/seq_file.h>
 #include <linux/rtmutex.h>
 #include <linux/init.h>
@@ -179,15 +180,17 @@ void __weak arch_release_task_struct(struct task_struct *tsk)
 
 static struct kmem_cache *task_struct_cachep;
 
-static inline struct task_struct *alloc_task_struct_node(int node)
+struct task_struct *alloc_task_struct_node(int node)
 {
 	return kmem_cache_alloc_node(task_struct_cachep, GFP_KERNEL, node);
 }
+EXPORT_SYMBOL_GPL(alloc_task_struct_node);
 
-static inline void free_task_struct(struct task_struct *tsk)
+void free_task_struct(struct task_struct *tsk)
 {
 	kmem_cache_free(task_struct_cachep, tsk);
 }
+EXPORT_SYMBOL_GPL(free_task_struct);
 
 #ifdef CONFIG_VMAP_STACK
 /*
@@ -279,7 +282,7 @@ err:
 	return ret;
 }
 
-static int alloc_thread_stack_node(struct task_struct *tsk, int node)
+int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
 	struct vm_struct *vm_area;
 	void *stack;
@@ -327,10 +330,11 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	tsk->stack_vm_area = vm_area;
 	stack = kasan_reset_tag(stack);
 	tsk->stack = stack;
-	return 0;
+ 	return 0;
 }
+EXPORT_SYMBOL_GPL(alloc_thread_stack_node);
 
-static void free_thread_stack(struct task_struct *tsk)
+void free_thread_stack(struct task_struct *tsk)
 {
 	if (!try_release_thread_stack_to_cache(tsk->stack_vm_area))
 		thread_stack_delayed_free(tsk);
@@ -338,6 +342,7 @@ static void free_thread_stack(struct task_struct *tsk)
 	tsk->stack = NULL;
 	tsk->stack_vm_area = NULL;
 }
+EXPORT_SYMBOL_GPL(free_thread_stack);
 
 #else /* !CONFIG_VMAP_STACK */
 
@@ -359,7 +364,7 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
 	call_rcu(rh, thread_stack_free_rcu);
 }
 
-static int alloc_thread_stack_node(struct task_struct *tsk, int node)
+int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
 	struct page *page = alloc_pages_node(node, THREADINFO_GFP,
 					     THREAD_SIZE_ORDER);
@@ -370,12 +375,14 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	}
 	return -ENOMEM;
 }
+EXPORT_SYMBOL_GPL(alloc_thread_stack_node);
 
-static void free_thread_stack(struct task_struct *tsk)
+void free_thread_stack(struct task_struct *tsk)
 {
 	thread_stack_delayed_free(tsk);
 	tsk->stack = NULL;
 }
+EXPORT_SYMBOL_GPL(free_thread_stack);
 
 #else /* !(THREAD_SIZE >= PAGE_SIZE) */
 
@@ -393,7 +400,7 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
 	call_rcu(rh, thread_stack_free_rcu);
 }
 
-static int alloc_thread_stack_node(struct task_struct *tsk, int node)
+int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
 	unsigned long *stack;
 	stack = kmem_cache_alloc_node(thread_stack_cache, THREADINFO_GFP, node);
@@ -401,12 +408,14 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	tsk->stack = stack;
 	return stack ? 0 : -ENOMEM;
 }
+EXPORT_SYMBOL_GPL(alloc_thread_stack_node);
 
-static void free_thread_stack(struct task_struct *tsk)
+void free_thread_stack(struct task_struct *tsk)
 {
 	thread_stack_delayed_free(tsk);
 	tsk->stack = NULL;
 }
+EXPORT_SYMBOL_GPL(free_thread_stack);
 
 void thread_stack_cache_init(void)
 {
@@ -420,7 +429,8 @@ void thread_stack_cache_init(void)
 #endif /* CONFIG_VMAP_STACK */
 
 /* SLAB cache for signal_struct structures (tsk->signal) */
-static struct kmem_cache *signal_cachep;
+struct kmem_cache *signal_cachep;
+EXPORT_SYMBOL_GPL(signal_cachep);
 
 /* SLAB cache for sighand_struct structures (tsk->sighand) */
 struct kmem_cache *sighand_cachep;
@@ -710,7 +720,7 @@ static void mmdrop_async(struct mm_struct *mm)
 	}
 }
 
-static inline void free_signal_struct(struct signal_struct *sig)
+void free_signal_struct(struct signal_struct *sig)
 {
 	taskstats_tgid_free(sig);
 	sched_autogroup_exit(sig);
@@ -722,6 +732,7 @@ static inline void free_signal_struct(struct signal_struct *sig)
 		mmdrop_async(sig->oom_mm);
 	kmem_cache_free(signal_cachep, sig);
 }
+EXPORT_SYMBOL_GPL(free_signal_struct);
 
 static inline void put_signal_struct(struct signal_struct *sig)
 {
@@ -969,6 +980,23 @@ free_tsk:
 	free_task_struct(tsk);
 	return NULL;
 }
+
+static __always_inline void delayed_free_task(struct task_struct *tsk);
+
+struct task_struct *superfork_dup_task_struct(struct task_struct *orig, int node)
+{
+	return dup_task_struct(orig, node);
+}
+EXPORT_SYMBOL_GPL(superfork_dup_task_struct);
+
+void superfork_free_task_struct(struct task_struct *tsk)
+{
+	WRITE_ONCE(tsk->__state, TASK_DEAD);
+	exit_task_stack_account(tsk);
+	put_task_stack(tsk);
+	delayed_free_task(tsk);
+}
+EXPORT_SYMBOL_GPL(superfork_free_task_struct);
 
 __cacheline_aligned_in_smp DEFINE_SPINLOCK(mmlist_lock);
 
@@ -1470,7 +1498,7 @@ void exec_mm_release(struct task_struct *tsk, struct mm_struct *mm)
  *
  * Return: the duplicated mm or NULL on failure.
  */
-static struct mm_struct *dup_mm(struct task_struct *tsk,
+struct mm_struct *dup_mm(struct task_struct *tsk,
 				struct mm_struct *oldmm)
 {
 	struct mm_struct *mm;
@@ -1510,7 +1538,7 @@ free_pt:
 fail_nomem:
 	return NULL;
 }
-
+EXPORT_SYMBOL_GPL(dup_mm);
 static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 {
 	struct mm_struct *mm, *oldmm;
@@ -1600,7 +1628,7 @@ static int copy_files(u64 clone_flags, struct task_struct *tsk,
 	return 0;
 }
 
-static int copy_sighand(u64 clone_flags, struct task_struct *tsk)
+int copy_sighand(u64 clone_flags, struct task_struct *tsk)
 {
 	struct sighand_struct *sig;
 
@@ -1624,6 +1652,7 @@ static int copy_sighand(u64 clone_flags, struct task_struct *tsk)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(copy_sighand);
 
 void __cleanup_sighand(struct sighand_struct *sighand)
 {
@@ -1649,7 +1678,7 @@ static void posix_cpu_timers_init_group(struct signal_struct *sig)
 	posix_cputimers_group_init(pct, cpu_limit);
 }
 
-static int copy_signal(u64 clone_flags, struct task_struct *tsk)
+int copy_signal(u64 clone_flags, struct task_struct *tsk)
 {
 	struct signal_struct *sig;
 
@@ -1704,6 +1733,7 @@ static int copy_signal(u64 clone_flags, struct task_struct *tsk)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(copy_signal);
 
 static void copy_seccomp(struct task_struct *p)
 {
@@ -1755,6 +1785,12 @@ static void rt_mutex_init_task(struct task_struct *p)
 #endif
 }
 
+void superfork_rt_mutex_init_task(struct task_struct *p)
+{
+	rt_mutex_init_task(p);
+}
+EXPORT_SYMBOL_GPL(superfork_rt_mutex_init_task);
+
 static inline void init_task_pid_links(struct task_struct *task)
 {
 	enum pid_type type;
@@ -1793,6 +1829,21 @@ static inline void rcu_copy_process(struct task_struct *p)
 	INIT_LIST_HEAD(&p->trc_blkd_node);
 #endif /* #ifdef CONFIG_TASKS_TRACE_RCU */
 }
+
+void superfork_rcu_copy_process(struct task_struct *p)
+{
+	rcu_copy_process(p);
+}
+EXPORT_SYMBOL_GPL(superfork_rcu_copy_process);
+
+void superfork_account_new_task(bool is_leader)
+{
+	if (is_leader)
+		__this_cpu_inc(process_counts);
+
+	nr_threads++;
+}
+EXPORT_SYMBOL_GPL(superfork_account_new_task);
 
 /**
  * pidfd_prepare - allocate a new pidfd_file and reserve a pidfd

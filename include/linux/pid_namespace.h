@@ -85,6 +85,8 @@ static inline int pidns_memfd_noexec_scope(struct pid_namespace *ns)
 
 extern struct pid_namespace *copy_pid_ns(u64 flags,
 	struct user_namespace *user_ns, struct pid_namespace *ns);
+extern struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
+					struct pid_namespace *parent_pid_ns);
 extern void zap_pid_ns_processes(struct pid_namespace *pid_ns);
 extern int reboot_pid_ns(struct pid_namespace *pid_ns, int cmd);
 extern void put_pid_ns(struct pid_namespace *ns);
@@ -111,6 +113,12 @@ static inline struct pid_namespace *copy_pid_ns(u64 flags,
 	if (flags & CLONE_NEWPID)
 		ns = ERR_PTR(-EINVAL);
 	return ns;
+}
+
+static inline struct pid_namespace *create_pid_namespace(
+	struct user_namespace *user_ns, struct pid_namespace *parent_pid_ns)
+{
+	return ERR_PTR(-EINVAL);
 }
 
 static inline void put_pid_ns(struct pid_namespace *ns)

@@ -160,4 +160,3 @@ void acct_clear_integrals(struct task_struct *tsk);
 #else
 static inline void acct_clear_integrals(struct task_struct *tsk) { }
 #endif
-

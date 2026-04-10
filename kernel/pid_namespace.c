@@ -73,7 +73,7 @@ static void dec_pid_namespaces(struct ucounts *ucounts)
 
 static void destroy_pid_namespace_work(struct work_struct *work);
 
-static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
+struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
 	struct pid_namespace *parent_pid_ns)
 {
 	struct pid_namespace *ns;
@@ -136,6 +136,7 @@ out_dec:
 out:
 	return ERR_PTR(err);
 }
+EXPORT_SYMBOL_GPL(create_pid_namespace);
 
 static void delayed_free_pidns(struct rcu_head *p)
 {

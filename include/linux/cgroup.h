@@ -837,4 +837,7 @@ struct cgroup *task_get_cgroup1(struct task_struct *tsk, int hierarchy_id);
 
 struct cgroup_of_peak *of_peak(struct kernfs_open_file *of);
 
+int superfork_cgroup_attach_task(struct task_struct *new_task,
+					struct task_struct *src_task);
+
 #endif /* _LINUX_CGROUP_H */

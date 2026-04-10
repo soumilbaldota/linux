@@ -10,6 +10,7 @@
 #include <linux/cgroup.h>
 #include <linux/cpumask.h>
 #include <linux/cred.h>
+#include <linux/user_namespace.h>
 #include <linux/delayacct.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>

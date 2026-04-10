@@ -5,6 +5,7 @@
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
+#include <linux/user_namespace.h>
 
 struct mnt_namespace;
 struct uts_namespace;
@@ -113,5 +114,9 @@ static inline void get_nsproxy(struct nsproxy *ns)
 }
 
 DEFINE_FREE(put_nsproxy, struct nsproxy *, if (_T) put_nsproxy(_T))
+
+struct nsproxy *create_new_namespaces(u64 flags,
+	struct task_struct *tsk, struct user_namespace *user_ns,
+	struct fs_struct *new_fs);
 
 #endif
