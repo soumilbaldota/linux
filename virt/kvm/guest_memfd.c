@@ -421,6 +421,12 @@ void kvm_gmem_init(struct module *module)
 	kvm_gmem_fops.owner = module;
 }
 
+bool file_is_kvm_gmem(struct file *file)
+{
+	return file && file->f_op == &kvm_gmem_fops;
+}
+EXPORT_SYMBOL_GPL(file_is_kvm_gmem);
+
 static int kvm_gmem_migrate_folio(struct address_space *mapping,
 				  struct folio *dst, struct folio *src,
 				  enum migrate_mode mode)

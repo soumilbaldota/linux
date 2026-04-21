@@ -1661,6 +1661,16 @@ struct task_struct {
 	struct thread_struct		thread;
 
 	/*
+	 * superfork: per-task snapshot of pt_regs captured at ioctl(KVM_RUN)
+	 * entry, populated by KVM when a freeze signal is about to break the
+	 * vCPU out of kvm_vcpu_block. Used in superfork_copy_thread so the
+	 * clone re-iret's to the syscall instruction and re-enters KVM_RUN
+	 * on its (cloned) kvm_vcpu fd, instead of resuming at futex_wait
+	 * inside pthread_cond_wait the way the source does.
+	 */
+	struct sf_vcpu_snap		*sf_vcpu_snap;
+
+	/*
 	 * New fields for task_struct should be added above here, so that
 	 * they are included in the randomized portion of task_struct.
 	 */

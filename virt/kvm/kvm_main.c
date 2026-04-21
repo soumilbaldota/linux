@@ -30,6 +30,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/stat.h>
+#include <linux/superfork.h>
 #include <linux/cpumask.h>
 #include <linux/smp.h>
 #include <linux/anon_inodes.h>
@@ -898,7 +899,7 @@ static const struct mmu_notifier_ops kvm_mmu_notifier_ops = {
 static int kvm_init_mmu_notifier(struct kvm *kvm)
 {
 	kvm->mmu_notifier.ops = &kvm_mmu_notifier_ops;
-	return mmu_notifier_register(&kvm->mmu_notifier, current->mm);
+	return mmu_notifier_register(&kvm->mmu_notifier, kvm->mm);
 }
 
 #else  /* !CONFIG_KVM_GENERIC_MMU_NOTIFIER */
@@ -3667,8 +3668,19 @@ bool kvm_vcpu_block(struct kvm_vcpu *vcpu)
 	for (;;) {
 		set_current_state(TASK_INTERRUPTIBLE);
 
-		if (kvm_vcpu_check_block(vcpu) < 0)
+		if (kvm_vcpu_check_block(vcpu) < 0) {
+			/*
+			 * superfork: if we're about to bounce out of KVM_RUN
+			 * because a freezer signal arrived, save the userspace
+			 * pt_regs now. The clone will replay this syscall
+			 * entry instead of resuming at futex_wait where QEMU
+			 * parks the vCPU in pthread_cond_wait with SIGUSR1
+			 * masked (unreachable from kernel).
+			 */
+			if (signal_pending(current))
+				superfork_kvm_vcpu_snapshot_entry();
 			break;
+		}
 
 		waited = true;
 		schedule();
@@ -4317,28 +4329,39 @@ static const struct file_operations kvm_vcpu_stats_fops = {
 	.llseek = noop_llseek,
 };
 
+struct file *kvm_vcpu_stats_file_create(struct kvm_vcpu *vcpu)
+{
+	char name[15 + ITOA_MAX_LEN + 1];
+	struct file *file;
+
+	snprintf(name, sizeof(name), "kvm-vcpu-stats:%d", vcpu->vcpu_id);
+
+	file = anon_inode_getfile_fmode(name, &kvm_vcpu_stats_fops, vcpu,
+					O_RDONLY, FMODE_PREAD);
+	if (IS_ERR(file))
+		return file;
+
+	kvm_get_kvm(vcpu->kvm);
+	return file;
+}
+EXPORT_SYMBOL_GPL(kvm_vcpu_stats_file_create);
+
 static int kvm_vcpu_ioctl_get_stats_fd(struct kvm_vcpu *vcpu)
 {
 	int fd;
 	struct file *file;
-	char name[15 + ITOA_MAX_LEN + 1];
-
-	snprintf(name, sizeof(name), "kvm-vcpu-stats:%d", vcpu->vcpu_id);
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)
 		return fd;
 
-	file = anon_inode_getfile_fmode(name, &kvm_vcpu_stats_fops, vcpu,
-					O_RDONLY, FMODE_PREAD);
+	file = kvm_vcpu_stats_file_create(vcpu);
 	if (IS_ERR(file)) {
 		put_unused_fd(fd);
 		return PTR_ERR(file);
 	}
 
-	kvm_get_kvm(vcpu->kvm);
 	fd_install(fd, file);
-
 	return fd;
 }
 
@@ -5120,6 +5143,20 @@ static const struct file_operations kvm_vm_stats_fops = {
 	.llseek = noop_llseek,
 };
 
+struct file *kvm_vm_stats_file_create(struct kvm *kvm)
+{
+	struct file *file;
+
+	file = anon_inode_getfile_fmode("kvm-vm-stats", &kvm_vm_stats_fops, kvm,
+					O_RDONLY, FMODE_PREAD);
+	if (IS_ERR(file))
+		return file;
+
+	kvm_get_kvm(kvm);
+	return file;
+}
+EXPORT_SYMBOL_GPL(kvm_vm_stats_file_create);
+
 static int kvm_vm_ioctl_get_stats_fd(struct kvm *kvm)
 {
 	int fd;
@@ -5129,16 +5166,13 @@ static int kvm_vm_ioctl_get_stats_fd(struct kvm *kvm)
 	if (fd < 0)
 		return fd;
 
-	file = anon_inode_getfile_fmode("kvm-vm-stats",
-			&kvm_vm_stats_fops, kvm, O_RDONLY, FMODE_PREAD);
+	file = kvm_vm_stats_file_create(kvm);
 	if (IS_ERR(file)) {
 		put_unused_fd(fd);
 		return PTR_ERR(file);
 	}
 
-	kvm_get_kvm(kvm);
 	fd_install(fd, file);
-
 	return fd;
 }
 
@@ -5488,7 +5522,41 @@ bool file_is_kvm_vcpu(struct file *file)
 }
 EXPORT_SYMBOL_GPL(file_is_kvm_vcpu);
 
+bool file_is_kvm_vcpu_stats(struct file *file)
+{
+	return file && file->f_op == &kvm_vcpu_stats_fops;
+}
+EXPORT_SYMBOL_GPL(file_is_kvm_vcpu_stats);
+
+bool file_is_kvm_vm_stats(struct file *file)
+{
+	return file && file->f_op == &kvm_vm_stats_fops;
+}
+EXPORT_SYMBOL_GPL(file_is_kvm_vm_stats);
+
+bool file_is_kvm_device(struct file *file)
+{
+	return file && file->f_op == &kvm_device_fops;
+}
+EXPORT_SYMBOL_GPL(file_is_kvm_device);
+
 unsigned long __weak kvm_arch_superfork_vm_type(struct kvm *kvm)
+{
+	return 0;
+}
+
+int __weak kvm_arch_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
+					      struct kvm_vcpu *src)
+{
+	return -EOPNOTSUPP;
+}
+
+int __weak kvm_arch_superfork_prepare_vm(struct kvm *dst, struct kvm *src)
+{
+	return 0;
+}
+
+int __weak kvm_arch_superfork_finalize_vm(struct kvm *dst, struct kvm *src)
 {
 	return 0;
 }
@@ -5579,54 +5647,30 @@ EXPORT_SYMBOL_GPL(kvm_superfork_set_memslot);
 int kvm_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
 				  struct kvm_vcpu *src)
 {
-	struct kvm_regs regs;
-	struct kvm_sregs sregs;
-	struct kvm_fpu fpu;
-	struct kvm_mp_state mp_state;
-	int ret;
-
 	if (!dst || !src)
 		return -EINVAL;
 
-	mutex_lock(&src->mutex);
-	ret = kvm_arch_vcpu_ioctl_get_regs(src, &regs);
-	if (ret)
-		goto out_src;
-
-	ret = kvm_arch_vcpu_ioctl_get_sregs(src, &sregs);
-	if (ret)
-		goto out_src;
-
-	ret = kvm_arch_vcpu_ioctl_get_fpu(src, &fpu);
-	if (ret)
-		goto out_src;
-
-	ret = kvm_arch_vcpu_ioctl_get_mpstate(src, &mp_state);
-	if (ret)
-		goto out_src;
-
-	mutex_lock(&dst->mutex);
-	ret = kvm_arch_vcpu_ioctl_set_regs(dst, &regs);
-	if (ret)
-		goto out_dst;
-
-	ret = kvm_arch_vcpu_ioctl_set_sregs(dst, &sregs);
-	if (ret)
-		goto out_dst;
-
-	ret = kvm_arch_vcpu_ioctl_set_fpu(dst, &fpu);
-	if (ret)
-		goto out_dst;
-
-	ret = kvm_arch_vcpu_ioctl_set_mpstate(dst, &mp_state);
-
-out_dst:
-	mutex_unlock(&dst->mutex);
-out_src:
-	mutex_unlock(&src->mutex);
-	return ret;
+	return kvm_arch_superfork_copy_vcpu_state(dst, src);
 }
 EXPORT_SYMBOL_GPL(kvm_superfork_copy_vcpu_state);
+
+int kvm_superfork_prepare_vm(struct kvm *dst, struct kvm *src)
+{
+	if (!dst || !src)
+		return -EINVAL;
+
+	return kvm_arch_superfork_prepare_vm(dst, src);
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_prepare_vm);
+
+int kvm_superfork_finalize_vm(struct kvm *dst, struct kvm *src)
+{
+	if (!dst || !src)
+		return -EINVAL;
+
+	return kvm_arch_superfork_finalize_vm(dst, src);
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_finalize_vm);
 
 static int kvm_dev_ioctl_create_vm(unsigned long type)
 {

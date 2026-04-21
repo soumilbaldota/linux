@@ -11043,12 +11043,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		}
 
 		if (kvm_dirty_ring_check_request(vcpu)) {
+			pr_err_ratelimited("SUPERFORK: vcpu_enter_guest dirty_ring r=0\n");
 			r = 0;
 			goto out;
 		}
 
 		if (kvm_check_request(KVM_REQ_GET_NESTED_STATE_PAGES, vcpu)) {
 			if (unlikely(!kvm_x86_ops.nested_ops->get_nested_state_pages(vcpu))) {
+				pr_err_ratelimited("SUPERFORK: vcpu_enter_guest nested_state_pages r=0\n");
 				r = 0;
 				goto out;
 			}
@@ -11610,7 +11612,10 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		if (kvm_vcpu_running(vcpu)) {
 			r = vcpu_enter_guest(vcpu);
 		} else {
+			pr_err_ratelimited("SUPERFORK: vcpu_run calling vcpu_block mp_state=%d\n", vcpu->arch.mp_state);
 			r = vcpu_block(vcpu);
+			if (r <= 0)
+				pr_err_ratelimited("SUPERFORK: vcpu_block returned r=%d\n", r);
 		}
 
 		if (r <= 0)
@@ -14360,6 +14365,498 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rmp_fault);
+
+/*
+ * superfork: in-kernel clone of a KVM vCPU/VM state.
+ *
+ * Mirrors the userspace KVM_GET_* | KVM_SET_* sequence that QEMU uses for
+ * live-migration restore, but operates entirely on kernel buffers with no
+ * copy_to/from_user. Called with src frozen (cgroup freezer) and dst newly
+ * created; neither is running.
+ *
+ * State is copied in the same order that __set_sregs_common requires:
+ * CPUID must land first because vcpu->arch.cr4_guest_rsvd_bits is derived
+ * from it, otherwise every feature-gated CR4 bit in src (OSXSAVE/SMEP/PKE/
+ * FSGSBASE/PCIDE/LA57/UMIP) is rejected by kvm_is_valid_cr4 on dst.
+ */
+int kvm_arch_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
+				       struct kvm_vcpu *src)
+{
+	struct kvm_lapic_state *lapic = NULL;
+	struct kvm_vcpu_events events;
+	struct kvm_debugregs dbgregs;
+	struct kvm_mp_state mp_state;
+	struct kvm_sregs *sregs = NULL;
+	struct kvm_regs regs;
+	struct kvm_xsave *xsave = NULL;
+	unsigned int xsave_size;
+	struct kvm_xcrs xcrs;
+	unsigned int i;
+	int ret;
+
+	if (!dst || !src)
+		return -EINVAL;
+
+	mutex_lock(&src->mutex);
+	mutex_lock(&dst->mutex);
+
+	/* 1. CPUID — gates CR4/MSR/XCR0 validity on dst. */
+	ret = kvm_superfork_copy_cpuid(dst, src);
+	if (ret) {
+		pr_err("superfork: copy_cpuid failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 2. MSRs (host_initiated → bypasses guest-feature validation). */
+	vcpu_load(src);
+	vcpu_load(dst);
+	for (i = 0; i < num_msrs_to_save; i++) {
+		u64 data;
+
+		if (kvm_msr_read(src, msrs_to_save[i], &data))
+			continue;
+		(void)kvm_msr_write(dst, msrs_to_save[i], data);
+	}
+	vcpu_put(dst);
+	vcpu_put(src);
+
+	/* 3. XSAVE (FPU + XSTATE header incl. components enabled via XCR0). */
+	xsave_size = max(src->arch.guest_fpu.uabi_size,
+			 dst->arch.guest_fpu.uabi_size);
+	xsave = kvzalloc(xsave_size, GFP_KERNEL);
+	if (!xsave) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	vcpu_load(src);
+	ret = kvm_vcpu_ioctl_x86_get_xsave2(src, (u8 *)xsave, xsave_size);
+	vcpu_put(src);
+	if (ret) {
+		pr_err("superfork: get_xsave2 failed: %d\n", ret);
+		goto out;
+	}
+
+	vcpu_load(dst);
+	if (fpstate_is_confidential(&dst->arch.guest_fpu)) {
+		ret = dst->kvm->arch.has_protected_state ? -EINVAL : 0;
+	} else {
+		ret = fpu_copy_uabi_to_guest_fpstate(&dst->arch.guest_fpu,
+						     (u8 *)xsave,
+						     kvm_caps.supported_xcr0,
+						     &dst->arch.pkru);
+	}
+	vcpu_put(dst);
+	if (ret) {
+		pr_err("superfork: set_xsave failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 4. XCRs (XCR0). */
+	vcpu_load(src);
+	ret = kvm_vcpu_ioctl_x86_get_xcrs(src, &xcrs);
+	vcpu_put(src);
+	if (!ret && xcrs.nr_xcrs) {
+		vcpu_load(dst);
+		ret = kvm_vcpu_ioctl_x86_set_xcrs(dst, &xcrs);
+		vcpu_put(dst);
+	}
+	if (ret) {
+		pr_err("superfork: copy_xcrs failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 5. SREGS — now CR4 validates because CPUID is in place. */
+	sregs = kzalloc(sizeof(*sregs), GFP_KERNEL);
+	if (!sregs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = kvm_arch_vcpu_ioctl_get_sregs(src, sregs);
+	if (ret) {
+		pr_err("superfork: get_sregs failed: %d\n", ret);
+		goto out;
+	}
+	ret = kvm_arch_vcpu_ioctl_set_sregs(dst, sregs);
+	if (ret) {
+		pr_err("superfork: set_sregs failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 6. GPRs + RIP + RFLAGS. */
+	ret = kvm_arch_vcpu_ioctl_get_regs(src, &regs);
+	if (ret)
+		goto out;
+	ret = kvm_arch_vcpu_ioctl_set_regs(dst, &regs);
+	if (ret) {
+		pr_err("superfork: set_regs failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 7. Debug regs. */
+	vcpu_load(src);
+	ret = kvm_vcpu_ioctl_x86_get_debugregs(src, &dbgregs);
+	vcpu_put(src);
+	if (!ret) {
+		vcpu_load(dst);
+		ret = kvm_vcpu_ioctl_x86_set_debugregs(dst, &dbgregs);
+		vcpu_put(dst);
+	}
+	if (ret) {
+		pr_err("superfork: copy_debugregs failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 8. LAPIC state (if in-kernel irqchip). */
+	if (lapic_in_kernel(src) && lapic_in_kernel(dst)) {
+		lapic = kzalloc(sizeof(*lapic), GFP_KERNEL);
+		if (!lapic) {
+			ret = -ENOMEM;
+			goto out;
+		}
+
+		vcpu_load(src);
+		ret = kvm_apic_get_state(src, lapic);
+		vcpu_put(src);
+		if (ret) {
+			pr_err("superfork: get_lapic failed: %d\n", ret);
+			goto out;
+		}
+
+		vcpu_load(dst);
+		ret = kvm_apic_set_state(dst, lapic);
+		vcpu_put(dst);
+		if (ret) {
+			pr_err("superfork: set_lapic failed: %d\n", ret);
+			goto out;
+		}
+	}
+
+	/*
+	 * 8b. Re-apply MSR_IA32_TSC_DEADLINE.
+	 *
+	 * Step 2's MSR write was a silent no-op: kvm_set_lapic_tscdeadline_msr
+	 * bails when !apic_lvtt_tscdeadline(apic), and dst's freshly-created
+	 * LAPIC has the reset LVT_TIMER (one-shot mode, masked) until step 8
+	 * restores the source's LVT_TIMER (TSC-deadline mode for modern Linux
+	 * guests). Result: dst->arch.apic->lapic_timer.tscdeadline stayed 0,
+	 * __start_apic_timer in step 8 fell through to start_sw_tscdeadline
+	 * which bails on !tscdeadline, the LAPIC hrtimer was never armed, and
+	 * a HALTed clone vCPU sat in kvm_vcpu_block forever (exits=0).
+	 *
+	 * Re-write the MSR now, with LAPIC in tscdeadline mode, so the timer
+	 * actually arms.
+	 */
+	if (lapic_in_kernel(src) && lapic_in_kernel(dst)) {
+		u64 tscdeadline;
+
+		vcpu_load(src);
+		ret = kvm_msr_read(src, MSR_IA32_TSC_DEADLINE, &tscdeadline);
+		vcpu_put(src);
+		if (!ret) {
+			vcpu_load(dst);
+			(void)kvm_msr_write(dst, MSR_IA32_TSC_DEADLINE,
+					    tscdeadline);
+			vcpu_put(dst);
+		}
+		ret = 0;
+	}
+
+	/* 9. Pending events (exceptions, interrupts, NMI/SMI, triple fault). */
+	vcpu_load(src);
+	kvm_vcpu_ioctl_x86_get_vcpu_events(src, &events);
+	vcpu_put(src);
+
+	vcpu_load(dst);
+	ret = kvm_vcpu_ioctl_x86_set_vcpu_events(dst, &events);
+	vcpu_put(dst);
+	if (ret) {
+		pr_err("superfork: set_vcpu_events failed: %d\n", ret);
+		goto out;
+	}
+
+	/* 10. MP state. */
+	ret = kvm_arch_vcpu_ioctl_get_mpstate(src, &mp_state);
+	if (ret)
+		goto out;
+	ret = kvm_arch_vcpu_ioctl_set_mpstate(dst, &mp_state);
+	if (ret)
+		pr_err("superfork: set_mpstate failed: %d\n", ret);
+
+out:
+	kfree(lapic);
+	kfree(sregs);
+	kvfree(xsave);
+	mutex_unlock(&dst->mutex);
+	mutex_unlock(&src->mutex);
+	return ret;
+}
+
+/*
+ * Prepare a destination VM with the arch-level bits that MUST be set before
+ * any vCPU is created: TSS address (VMX w/o unrestricted guest), identity
+ * map, in-kernel IRQCHIP, in-kernel PIT, default TSC khz.
+ *
+ * Only called from superfork; src VM is frozen, dst VM is freshly created
+ * and has no vCPUs yet.
+ */
+int kvm_arch_superfork_prepare_vm(struct kvm *dst, struct kvm *src)
+{
+	int ret;
+
+	if (!dst || !src)
+		return -EINVAL;
+
+	/*
+	 * default_tsc_khz must be copied before the first vCPU is created:
+	 * kvm_arch_vcpu_create uses it to seed the vcpu's tsc.
+	 */
+	WRITE_ONCE(dst->arch.default_tsc_khz,
+		   READ_ONCE(src->arch.default_tsc_khz));
+
+	/*
+	 * superfork_clone_kvm_memslots has already copied the APIC access page
+	 * private memslot from src to dst.  Propagate the matching arch flags
+	 * so that kvm_alloc_apic_access_page (called from vmx_vcpu_create) does
+	 * not try to re-install the memslot, which would return -EEXIST from
+	 * __x86_set_memory_region and abort vCPU creation.
+	 */
+	scoped_guard(mutex, &dst->slots_lock) {
+		dst->arch.apic_access_memslot_enabled =
+			READ_ONCE(src->arch.apic_access_memslot_enabled);
+		dst->arch.apic_access_memslot_inhibited =
+			READ_ONCE(src->arch.apic_access_memslot_inhibited);
+	}
+
+	/*
+	 * Propagate VM-wide capability bits enabled on src via KVM_ENABLE_CAP /
+	 * KVM_SET_* before any vCPU is created or its state is copied.
+	 *
+	 * exception_payload_enabled and triple_fault_event in particular gate
+	 * kvm_vcpu_ioctl_x86_set_vcpu_events: if the source sets the matching
+	 * flag in kvm_vcpu_events (KVM_VCPUEVENT_VALID_PAYLOAD /
+	 * KVM_VCPUEVENT_VALID_TRIPLE_FAULT) and dst hasn't enabled the cap,
+	 * set_vcpu_events returns -EINVAL and superfork_copy_vcpu_state aborts.
+	 */
+	dst->arch.exception_payload_enabled = src->arch.exception_payload_enabled;
+	dst->arch.triple_fault_event = src->arch.triple_fault_event;
+	dst->arch.x2apic_format = src->arch.x2apic_format;
+	dst->arch.x2apic_broadcast_quirk_disabled =
+		src->arch.x2apic_broadcast_quirk_disabled;
+	dst->arch.guest_can_read_msr_platform_info =
+		src->arch.guest_can_read_msr_platform_info;
+	dst->arch.bus_lock_detection_enabled = src->arch.bus_lock_detection_enabled;
+	dst->arch.enable_pmu = src->arch.enable_pmu;
+	dst->arch.exit_on_emulation_error = src->arch.exit_on_emulation_error;
+	dst->arch.hypercall_exit_enabled = src->arch.hypercall_exit_enabled;
+	dst->arch.disabled_quirks = src->arch.disabled_quirks;
+	dst->arch.notify_window = src->arch.notify_window;
+	dst->arch.notify_vmexit_flags = src->arch.notify_vmexit_flags;
+	dst->arch.user_space_msr_mask = src->arch.user_space_msr_mask;
+	dst->arch.bsp_vcpu_id = src->arch.bsp_vcpu_id;
+
+	/*
+	 * TSS addr: set_tss_addr is a no-op on CPUs with enable_unrestricted_guest,
+	 * but for safety we always propagate. 0xfeffd000 matches QEMU's default;
+	 * reading src's tss_addr back would require a new vendor callback.
+	 */
+	if (kvm_x86_ops.set_tss_addr) {
+		ret = kvm_x86_call(set_tss_addr)(dst, 0xfeffd000);
+		if (ret) {
+			pr_err("superfork: set_tss_addr failed: %d\n", ret);
+			return ret;
+		}
+	}
+
+	/*
+	 * Identity map addr: default is fine for modern EPT; propagate only if
+	 * vendor supports it.
+	 */
+	if (kvm_x86_ops.set_identity_map_addr) {
+		ret = kvm_x86_call(set_identity_map_addr)(dst,
+					VMX_EPT_IDENTITY_PAGETABLE_ADDR);
+		if (ret)
+			pr_warn("superfork: set_identity_map_addr failed: %d\n",
+				ret);
+	}
+
+#ifdef CONFIG_KVM_IOAPIC
+	/* In-kernel IRQCHIP (PIC + IOAPIC). QEMU's default. */
+	if (irqchip_in_kernel(src) && !irqchip_in_kernel(dst)) {
+		mutex_lock(&dst->lock);
+
+		if (dst->created_vcpus) {
+			mutex_unlock(&dst->lock);
+			pr_err("superfork: prepare_vm: dst already has vCPUs\n");
+			return -EINVAL;
+		}
+
+		ret = kvm_pic_init(dst);
+		if (ret) {
+			mutex_unlock(&dst->lock);
+			return ret;
+		}
+
+		ret = kvm_ioapic_init(dst);
+		if (ret) {
+			kvm_pic_destroy(dst);
+			mutex_unlock(&dst->lock);
+			return ret;
+		}
+
+		ret = kvm_setup_default_ioapic_and_pic_routing(dst);
+		if (ret) {
+			kvm_ioapic_destroy(dst);
+			kvm_pic_destroy(dst);
+			mutex_unlock(&dst->lock);
+			return ret;
+		}
+
+		smp_wmb();
+		dst->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
+		kvm_clear_apicv_inhibit(dst, APICV_INHIBIT_REASON_ABSENT);
+		mutex_unlock(&dst->lock);
+	}
+
+	/* In-kernel PIT (i8254). */
+	if (src->arch.vpit && !dst->arch.vpit) {
+		mutex_lock(&dst->lock);
+		if (!dst->arch.vpit) {
+			dst->arch.vpit = kvm_create_pit(dst, KVM_PIT_SPEAKER_DUMMY);
+			if (!dst->arch.vpit) {
+				mutex_unlock(&dst->lock);
+				return -ENOMEM;
+			}
+		}
+		mutex_unlock(&dst->lock);
+	}
+#endif
+
+	return 0;
+}
+
+/*
+ * Copy shared VM state that can only be restored once all vCPUs exist:
+ * IRQCHIP state (PIC master/slave + IOAPIC) and PIT state.
+ */
+int kvm_arch_superfork_finalize_vm(struct kvm *dst, struct kvm *src)
+{
+	int ret = 0;
+#ifdef CONFIG_KVM_IOAPIC
+	struct kvm_irqchip *chip = NULL;
+	struct kvm_pit_state2 ps2;
+	int i;
+#endif
+
+	if (!dst || !src)
+		return -EINVAL;
+
+#ifdef CONFIG_KVM_IOAPIC
+	if (irqchip_in_kernel(src) && irqchip_in_kernel(dst)) {
+		chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+		if (!chip)
+			return -ENOMEM;
+
+		for (i = 0; i < 3; i++) {
+			chip->chip_id = i;
+			ret = kvm_vm_ioctl_get_irqchip(src, chip);
+			if (ret) {
+				pr_err("superfork: get_irqchip[%d] failed: %d\n",
+				       i, ret);
+				goto out_free_chip;
+			}
+			ret = kvm_vm_ioctl_set_irqchip(dst, chip);
+			if (ret) {
+				pr_err("superfork: set_irqchip[%d] failed: %d\n",
+				       i, ret);
+				goto out_free_chip;
+			}
+		}
+
+out_free_chip:
+		kfree(chip);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Re-assert IOAPIC IRQ input levels from source.
+	 *
+	 * kvm_set_ioapic restores the redirection table (including remote_irr=1
+	 * from interrupts in-flight in the source) and tries to re-inject pending
+	 * IRQs.  But remote_irr=1 on a level-triggered pin blocks ioapic_service,
+	 * silently dropping any interrupt that was being delivered.
+	 *
+	 * Fix: clear remote_irr for every level-triggered pin in the clone IOAPIC,
+	 * then re-assert the source's input-line levels so the IOAPIC delivers them
+	 * to the clone LAPIC on first vCPU entry.
+	 *
+	 * Also unconditionally pulse ISA IRQ4 (COM1) if it was not already in irr.
+	 * The source UART may have LSR.DR=1 (byte in receive buffer) even when
+	 * irr[4]=0 — the Linux serial8250 driver falls back to a ~2s polling timer
+	 * (serial8250_timeout) when the IRQ line is not asserted.  Pulsing IRQ4
+	 * forces the serial ISR to run immediately so the UART buffer is drained
+	 * before user space connects to the clone's serial socket.
+	 */
+	if (ioapic_in_kernel(src) && ioapic_in_kernel(dst) &&
+	    src->arch.vioapic && dst->arch.vioapic) {
+		struct kvm_ioapic *src_ioapic = src->arch.vioapic;
+		struct kvm_ioapic *dst_ioapic = dst->arch.vioapic;
+		u32 src_irr;
+		int pin;
+
+		spin_lock(&src_ioapic->lock);
+		src_irr = src_ioapic->irr;
+		spin_unlock(&src_ioapic->lock);
+
+		/* Clear remote_irr so ioapic_service can re-deliver pending
+		 * level-triggered IRQs.  The in-flight interrupt for each pin is
+		 * already captured in the clone LAPIC state (copied in step 8 of
+		 * kvm_arch_superfork_copy_vcpu_state), so there is no double-delivery
+		 * risk: the LAPIC simply OR-in the vector, which is idempotent.
+		 */
+		spin_lock(&dst_ioapic->lock);
+		for (pin = 0; pin < IOAPIC_NUM_PINS; pin++) {
+			if (dst_ioapic->redirtbl[pin].fields.trig_mode ==
+			    IOAPIC_LEVEL_TRIG)
+				dst_ioapic->redirtbl[pin].fields.remote_irr = 0;
+		}
+		spin_unlock(&dst_ioapic->lock);
+
+		for (pin = 0; pin < IOAPIC_NUM_PINS; pin++) {
+			if (src_irr & (1u << pin))
+				kvm_set_irq(dst, KVM_USERSPACE_IRQ_SOURCE_ID,
+					    pin, 1, false);
+		}
+
+		/* ISA IRQ4 (COM1): pulse even if not in src_irr, in case the source
+		 * UART has LSR.DR=1 but the IRQ line was already deasserted.
+		 */
+		if (!(src_irr & (1u << 4))) {
+			kvm_set_irq(dst, KVM_USERSPACE_IRQ_SOURCE_ID,
+				    4, 1, false);
+			kvm_set_irq(dst, KVM_USERSPACE_IRQ_SOURCE_ID,
+				    4, 0, false);
+		}
+	}
+
+	if (src->arch.vpit && dst->arch.vpit) {
+		ret = kvm_vm_ioctl_get_pit2(src, &ps2);
+		if (ret) {
+			pr_err("superfork: get_pit2 failed: %d\n", ret);
+			return ret;
+		}
+		mutex_lock(&dst->lock);
+		ret = kvm_vm_ioctl_set_pit2(dst, &ps2);
+		mutex_unlock(&dst->lock);
+		if (ret)
+			pr_err("superfork: set_pit2 failed: %d\n", ret);
+	}
+#endif
+
+	return ret;
+}
 
 static int __init kvm_x86_init(void)
 {

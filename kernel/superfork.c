@@ -158,6 +158,139 @@ static int cgroup_thaw_sync(struct cgroup *cgrp)
 	return cgroup_do_freeze_thaw(cgrp, false);
 }
 
+#define SUPERFORK_THAW_RETRIES 3
+
+struct sf_src_cgroup_move {
+	pid_t tgid;
+	struct task_struct *leader;
+	struct cgroup *orig_cgrp;
+	bool moved;
+};
+
+static int superfork_thaw_source_cgroup_sync(struct cgroup *src_cgrp,
+					      const char *stage)
+{
+	int attempt;
+	int ret = 0;
+
+	if (!src_cgrp)
+		return 0;
+
+	for (attempt = 1; attempt <= SUPERFORK_THAW_RETRIES; attempt++) {
+		ret = cgroup_thaw_sync(src_cgrp);
+		if (!ret)
+			return 0;
+
+		pr_warn("superfork: cgroup_thaw_sync failed at stage=%s attempt=%d/%d ret=%d\n",
+			stage ? stage : "unknown", attempt,
+			SUPERFORK_THAW_RETRIES, ret);
+		schedule_timeout_uninterruptible(msecs_to_jiffies(1));
+	}
+
+	pr_err("superfork: unable to thaw source cgroup at stage=%s: %d\n",
+	       stage ? stage : "unknown", ret);
+	return ret;
+}
+
+static int superfork_restore_source_task_cgroups(struct sf_src_cgroup_move *moves,
+						 size_t count)
+{
+	int ret = 0;
+	size_t i;
+
+	if (!moves)
+		return 0;
+
+	for (i = 0; i < count; i++) {
+		int attach_ret;
+
+		if (!moves[i].moved || !moves[i].leader || !moves[i].orig_cgrp)
+			continue;
+
+		attach_ret = cgroup_attach_task(moves[i].orig_cgrp,
+						moves[i].leader, true);
+		if (attach_ret < 0) {
+			pr_err("superfork: failed to restore source tgid=%d to original cgroup: %d\n",
+			       moves[i].tgid, attach_ret);
+			if (!ret)
+				ret = attach_ret;
+			continue;
+		}
+
+		moves[i].moved = false;
+	}
+
+	return ret;
+}
+
+static void superfork_put_source_task_cgroup_moves(struct sf_src_cgroup_move *moves,
+						    size_t count)
+{
+	size_t i;
+
+	if (!moves)
+		return;
+
+	for (i = 0; i < count; i++) {
+		if (moves[i].orig_cgrp)
+			cgroup_put(moves[i].orig_cgrp);
+		if (moves[i].leader)
+			put_task_struct(moves[i].leader);
+	}
+}
+
+static int superfork_prepare_source_task_cgroups(struct cgroup *src_cgrp,
+						 const pid_t *kpids,
+						 size_t count,
+						 struct sf_src_cgroup_move *moves)
+{
+	size_t i;
+
+	if (!src_cgrp || !kpids || !moves)
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		struct task_struct *task;
+		struct task_struct *leader;
+		struct cgroup *orig_cgrp;
+		int ret;
+
+		moves[i].tgid = kpids[i];
+
+		rcu_read_lock();
+		task = find_task_by_vpid(kpids[i]);
+		if (!task) {
+			rcu_read_unlock();
+			pr_err("superfork: source tgid %d disappeared before cgroup prep\n",
+			       kpids[i]);
+			return -ESRCH;
+		}
+
+		leader = task->group_leader;
+		get_task_struct(leader);
+		orig_cgrp = task_dfl_cgroup(leader);
+		cgroup_get(orig_cgrp);
+		rcu_read_unlock();
+
+		moves[i].leader = leader;
+		moves[i].orig_cgrp = orig_cgrp;
+
+		if (orig_cgrp == src_cgrp)
+			continue;
+
+		ret = cgroup_attach_task(src_cgrp, leader, true);
+		if (ret < 0) {
+			pr_err("superfork: failed to move source tgid=%d into src cgroup: %d\n",
+			       kpids[i], ret);
+			return ret;
+		}
+
+		moves[i].moved = true;
+	}
+
+	return 0;
+}
+
 
 static struct tgid_clone_entry *find_or_create_tgid_entry(
 	struct container_clone_ctx *ctx, pid_t old_tgid)
@@ -516,6 +649,8 @@ enum fd_action_type {
 	FD_ACT_SIGNALFD_NEW,
 	FD_ACT_KVM_VM,
 	FD_ACT_KVM_VCPU,
+	FD_ACT_KVM_VM_STATS,
+	FD_ACT_KVM_VCPU_STATS,
 	FD_ACT_UNIX_SOCK_SERVER
 };
 
@@ -544,6 +679,42 @@ static bool superfork_is_kvm_vcpu_file(struct file *file)
 #endif
 }
 
+static bool superfork_is_kvm_vm_stats_file(struct file *file)
+{
+#ifdef CONFIG_KVM
+	return file_is_kvm_vm_stats(file);
+#else
+	return false;
+#endif
+}
+
+static bool superfork_is_kvm_vcpu_stats_file(struct file *file)
+{
+#ifdef CONFIG_KVM
+	return file_is_kvm_vcpu_stats(file);
+#else
+	return false;
+#endif
+}
+
+static bool superfork_is_kvm_device_file(struct file *file)
+{
+#ifdef CONFIG_KVM
+	return file_is_kvm_device(file);
+#else
+	return false;
+#endif
+}
+
+static bool superfork_is_kvm_gmem_file(struct file *file)
+{
+#ifdef CONFIG_KVM
+	return file_is_kvm_gmem(file);
+#else
+	return false;
+#endif
+}
+
 static int superfork_collect_fd_action(const void *arg, struct file *file,
 				       unsigned int fd)
 {
@@ -556,6 +727,38 @@ static int superfork_collect_fd_action(const void *arg, struct file *file,
 		act->type = FD_ACT_KVM_VM;
 		act->file = get_file(file);
 		act->hint = "kvm_vm";
+		return fd + 1;
+	}
+
+	if (superfork_is_kvm_vm_stats_file(file)) {
+		act->fd = fd;
+		act->type = FD_ACT_KVM_VM_STATS;
+		act->file = get_file(file);
+		act->hint = "kvm_vm_stats";
+		return fd + 1;
+	}
+
+	if (superfork_is_kvm_vcpu_stats_file(file)) {
+		act->fd = fd;
+		act->type = FD_ACT_KVM_VCPU_STATS;
+		act->file = get_file(file);
+		act->hint = "kvm_vcpu_stats";
+		return fd + 1;
+	}
+
+	if (superfork_is_kvm_device_file(file)) {
+		act->fd = fd;
+		act->type = FD_ACT_UNSUPPORTED;
+		act->file = get_file(file);
+		act->hint = "kvm_device";
+		return fd + 1;
+	}
+
+	if (superfork_is_kvm_gmem_file(file)) {
+		act->fd = fd;
+		act->type = FD_ACT_UNSUPPORTED;
+		act->file = get_file(file);
+		act->hint = "kvm_gmem";
 		return fd + 1;
 	}
 
@@ -893,6 +1096,7 @@ out_err:
 	return ERR_PTR(ret);
 }
 
+#ifdef CONFIG_KVM
 static int superfork_clone_kvm_memslots(struct kvm *src_kvm, struct kvm *dst_kvm)
 {
 	int as_id;
@@ -966,6 +1170,10 @@ static int superfork_clone_kvm_vm_fd(struct files_struct *files,
 	if (ret)
 		goto out_put_new_vm;
 
+	ret = kvm_superfork_prepare_vm(new_kvm, src_kvm);
+	if (ret)
+		goto out_put_new_vm;
+
 	ret = superfork_replace_file_at(files, fd, new_vm_file);
 	if (ret)
 		goto out_put_new_vm;
@@ -1004,9 +1212,37 @@ static struct sf_kvm_vm_map *superfork_find_kvm_vm_map(struct tgid_clone_entry *
 	return NULL;
 }
 
+static void superfork_remap_kvm_vcpu_vma(struct mm_struct *new_mm,
+					  struct file *src_file,
+					  struct file *new_vcpu_file)
+{
+	VMA_ITERATOR(vmi, new_mm, 0);
+	struct vm_area_struct *vma;
+	int found = 0;
+
+	int scanned = 0;
+
+	mmap_write_lock(new_mm);
+	for_each_vma(vmi, vma) {
+		scanned++;
+		if (vma->vm_file == src_file) {
+			vma_set_file(vma, new_vcpu_file);
+			zap_vma_pages(vma);
+			found++;
+		}
+	}
+	mmap_write_unlock(new_mm);
+
+	pr_info("superfork: kvm_run VMA remap: scanned=%d found=%d (src=%p new=%p)\n",
+		scanned, found, src_file, new_vcpu_file);
+	if (!found)
+		pr_warn("superfork: kvm_run VMA not found for vcpu fd remap\n");
+}
+
 static int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 					unsigned int fd,
 					struct file *src_file,
+					struct mm_struct *new_mm,
 					struct tgid_clone_entry *tgid_entry)
 {
 	struct kvm_vcpu *src_vcpu;
@@ -1031,6 +1267,11 @@ static int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 	if (ret)
 		return ret;
 
+	/* Tell QEMU the ioctl was interrupted by a signal so it loops back
+	 * and re-issues KVM_RUN rather than treating exit_reason=0 as an
+	 * unknown hardware exit and stopping the VM. */
+	new_vcpu->run->exit_reason = KVM_EXIT_INTR;
+
 	ret = kvm_superfork_copy_vcpu_state(new_vcpu, src_vcpu);
 	if (ret)
 		goto out_put_new_vcpu;
@@ -1038,6 +1279,13 @@ static int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 	ret = superfork_replace_file_at(files, fd, new_vcpu_file);
 	if (ret)
 		goto out_put_new_vcpu;
+
+	pr_info("superfork: vcpu fd %u clone done, new_mm=%p src_file=%p new_vcpu_file=%p\n",
+		fd, new_mm, src_file, new_vcpu_file);
+	if (new_mm)
+		superfork_remap_kvm_vcpu_vma(new_mm, src_file, new_vcpu_file);
+	else
+		pr_warn("superfork: skipping VMA remap: new_mm is NULL\n");
 
 	if (vm_map->vcpu_count < SF_MAX_KVM_VCPUS_PER_VM) {
 		int idx = vm_map->vcpu_count++;
@@ -1054,6 +1302,7 @@ out_put_new_vcpu:
 	fput(new_vcpu_file);
 	return ret;
 }
+#endif /* CONFIG_KVM */
 
 struct sf_fd_alias_entry {
 	struct file *src_file;
@@ -1129,6 +1378,38 @@ static struct file *superfork_fd_alias_map_find(const struct sf_fd_alias_map *ma
 	return NULL;
 }
 
+#ifdef CONFIG_KVM
+/*
+ * Stats fds (KVM_GET_STATS_FD) share ->private_data with their parent VM or
+ * vCPU file. Recover the cloned parent by matching private_data against the
+ * already-populated alias map. Relies on the fact that iterate_fd() visits
+ * slots in ascending order and qemu always creates the parent fd before its
+ * stats fd; if that invariant is ever broken the caller will see -ENOENT and
+ * refuse to clone rather than corrupt state.
+ */
+static struct file *superfork_fd_alias_map_find_kvm_parent(
+					const struct sf_fd_alias_map *map,
+					void *private_data,
+					bool want_vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < map->count; i++) {
+		struct file *src = map->entries[i].src_file;
+
+		if (!src || src->private_data != private_data)
+			continue;
+		if (want_vm && !file_is_kvm(src))
+			continue;
+		if (!want_vm && !file_is_kvm_vcpu(src))
+			continue;
+		return get_file(map->entries[i].new_file);
+	}
+
+	return NULL;
+}
+#endif /* CONFIG_KVM */
+
 static int superfork_fd_alias_map_add(struct sf_fd_alias_map *map,
 				      struct file *src_file,
 				      struct file *new_file)
@@ -1178,6 +1459,8 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 			if (replacement) {
 				replacement_needs_install = true;
 				replacement_from_map = true;
+				pr_info("superfork: fd %u type=%d hit alias map, skipping clone\n",
+					action.fd, action.type);
 			}
 		}
 
@@ -1189,6 +1472,7 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				ret = -EOPNOTSUPP;
 				fput(action.file);
 				goto out;
+#ifdef CONFIG_KVM
 			case FD_ACT_KVM_VM: {
 				int rc = superfork_clone_kvm_vm_fd(files, action.fd, action.file,
 							       new_mm, tgid_entry);
@@ -1212,8 +1496,11 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				break;
 			}
 			case FD_ACT_KVM_VCPU: {
-				int rc = superfork_clone_kvm_vcpu_fd(files, action.fd, action.file,
-								 tgid_entry);
+				int rc;
+				pr_info("superfork: processing KVM_VCPU fd %u file=%p new_mm=%p\n",
+					action.fd, action.file, new_mm);
+				rc = superfork_clone_kvm_vcpu_fd(files, action.fd, action.file,
+								 new_mm, tgid_entry);
 				if (rc < 0) {
 					pr_err("superfork: failed to clone KVM vCPU fd %u: %d\n",
 					       action.fd, rc);
@@ -1238,6 +1525,67 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				}
 				break;
 			}
+			case FD_ACT_KVM_VM_STATS: {
+				struct file *parent_new;
+				struct kvm *new_kvm;
+				struct file *new_file;
+
+				parent_new = superfork_fd_alias_map_find_kvm_parent(
+					&alias_map, action.file->private_data, true);
+				if (!parent_new) {
+					pr_err("superfork: kvm_vm_stats fd %u has no cloned parent VM\n",
+					       action.fd);
+					ret = -ENOENT;
+					fput(action.file);
+					goto out;
+				}
+
+				new_kvm = parent_new->private_data;
+				new_file = kvm_vm_stats_file_create(new_kvm);
+				fput(parent_new);
+				if (IS_ERR(new_file)) {
+					ret = PTR_ERR(new_file);
+					pr_err("superfork: kvm_vm_stats clone failed at fd %u: %d\n",
+					       action.fd, ret);
+					fput(action.file);
+					goto out;
+				}
+				replacement = new_file;
+				replacement_needs_install = true;
+				replacement_should_track = true;
+				break;
+			}
+			case FD_ACT_KVM_VCPU_STATS: {
+				struct file *parent_new;
+				struct kvm_vcpu *new_vcpu;
+				struct file *new_file;
+
+				parent_new = superfork_fd_alias_map_find_kvm_parent(
+					&alias_map, action.file->private_data, false);
+				if (!parent_new) {
+					pr_err("superfork: kvm_vcpu_stats fd %u has no cloned parent vCPU\n",
+					       action.fd);
+					ret = -ENOENT;
+					fput(action.file);
+					goto out;
+				}
+
+				new_vcpu = parent_new->private_data;
+				new_file = kvm_vcpu_stats_file_create(new_vcpu);
+				fput(parent_new);
+				if (IS_ERR(new_file)) {
+					ret = PTR_ERR(new_file);
+					pr_err("superfork: kvm_vcpu_stats clone failed at fd %u: %d\n",
+					       action.fd, ret);
+					fput(action.file);
+					goto out;
+				}
+				replacement = new_file;
+				replacement_needs_install = true;
+				replacement_should_track = true;
+				break;
+			}
+#endif /* CONFIG_KVM */
 			case FD_ACT_SIGNALFD_NEW: {
 				sigset_t mask;
 				struct file *new_file;
@@ -1351,6 +1699,28 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 
 out:
 	superfork_fd_alias_map_release(&alias_map);
+
+#ifdef CONFIG_KVM
+	if (ret >= 0 && tgid_entry) {
+		int i;
+
+		for (i = 0; i < tgid_entry->kvm_vm_count; i++) {
+			struct sf_kvm_vm_map *vm = &tgid_entry->kvm_vms[i];
+			int rc;
+
+			if (!vm->new_kvm || !vm->src_kvm)
+				continue;
+
+			rc = kvm_superfork_finalize_vm(vm->new_kvm, vm->src_kvm);
+			if (rc < 0) {
+				pr_err("superfork: finalize_vm failed: %d\n", rc);
+				ret = rc;
+				break;
+			}
+		}
+	}
+#endif
+
 	return ret < 0 ? ret : 0;
 }
 
@@ -2325,8 +2695,20 @@ static struct task_struct *superfork_copy_process(
 	if (!p)
 		return ERR_PTR(-ENOMEM);
 
-	/* Clear kernel thread flag if set */
-	p->flags &= ~PF_KTHREAD;
+	/*
+	 * The sf_vcpu_snap pointer is owned by the source task (allocated by
+	 * superfork_alloc_vcpu_snaps and read in superfork_copy_thread). The
+	 * clone must not share it; dup_task_struct shallow-copies the field.
+	 */
+	p->sf_vcpu_snap = NULL;
+
+	/*
+	 * Do NOT clear PF_KTHREAD / PF_USER_WORKER here: those task classes
+	 * take the kthread/user-worker resume path in superfork_copy_thread()
+	 * which depends on the flag surviving, and the scheduler / signal
+	 * code also consults it.  The clone of a kthread is still a kthread;
+	 * the clone of a vhost_task is still a vhost_task.
+	 */
 
 	/*
 	 * Clear the frozen flag. The source task is frozen in its cgroup,
@@ -2356,18 +2738,30 @@ static struct task_struct *superfork_copy_process(
 		clear_ti_thread_flag(ti, TIF_NEED_RESCHED_LAZY);
 		clear_ti_thread_flag(ti, TIF_NOTIFY_RESUME);
 		clear_ti_thread_flag(ti, TIF_NOTIFY_SIGNAL);
+#ifdef TIF_FREEZE
 		clear_ti_thread_flag(ti, TIF_FREEZE);
-		clear_ti_thread_flag(ti, TIF_RESTORE_SIGMASK);
+#endif
+		/*
+		 * TIF_RESTORE_SIGMASK only exists on architectures that define
+		 * HAVE_TIF_RESTORE_SIGMASK (e.g. arm64).  On x86 and others the
+		 * kernel uses task->restore_sigmask instead; clear_tsk_restore_sigmask()
+		 * handles both cases portably.
+		 */
+		clear_tsk_restore_sigmask(p);
 
 		/*
 		 * Reset preempt_count using the proper macro.
 		 * This ensures the value is correct for the architecture.
 		 */
+#ifdef CONFIG_ARM64
 		pr_debug("superfork: before init_preempt_count, preempt.count=0x%x\n",
 			 ti->preempt.count);
+#endif
 		init_task_preempt_count(p);
+#ifdef CONFIG_ARM64
 		pr_debug("superfork: after init_preempt_count, preempt.count=0x%x\n",
 			 ti->preempt.count);
+#endif
 	}
 
 	/*
@@ -2478,12 +2872,14 @@ static struct task_struct *superfork_copy_process(
 		goto bad_fork_cleanup_policy;
 	}
 
+#ifdef CONFIG_ARM64
 	/* Debug: check preempt_count after sched_fork */
 	{
 		struct thread_info *ti = task_thread_info(p);
 		pr_debug("superfork: after sched_fork, preempt.count=0x%x\n",
 			 ti->preempt.count);
 	}
+#endif
 
 	retval = perf_event_init_task(p, clone_flags);
 	if (retval) {
@@ -2598,12 +2994,14 @@ static struct task_struct *superfork_copy_process(
 		goto bad_fork_cleanup_namespaces;
 	}
 
+#ifdef CONFIG_ARM64
 	/* Debug: check preempt_count after copy_thread */
 	{
 		struct thread_info *ti = task_thread_info(p);
 		pr_debug("superfork: after copy_thread, preempt.count=0x%x\n",
 			 ti->preempt.count);
 	}
+#endif
 
 	/*
 	 * Step 9: Allocate PID
@@ -2939,6 +3337,7 @@ static void superfork_wake_tasks(struct container_clone_ctx *ctx)
 
         init_task_preempt_count(p);
 
+#ifdef CONFIG_ARM64
         {
             struct pt_regs *regs = task_pt_regs(p);
             u64 pstate = regs->pstate;
@@ -2960,6 +3359,7 @@ static void superfork_wake_tasks(struct container_clone_ctx *ctx)
                 continue;
             }
         }
+#endif /* CONFIG_ARM64 */
 
         wake_up_new_task(p);
     }
@@ -2986,6 +3386,7 @@ static void superfork_wake_tasks(struct container_clone_ctx *ctx)
 
         init_task_preempt_count(p);
 
+#ifdef CONFIG_ARM64
         {
             struct pt_regs *regs = task_pt_regs(p);
             u64 pstate = regs->pstate;
@@ -3007,8 +3408,128 @@ static void superfork_wake_tasks(struct container_clone_ctx *ctx)
                 continue;
             }
         }
+#endif /* CONFIG_ARM64 */
 
         wake_up_new_task(p);
+    }
+}
+
+/*
+ * vCPU snapshot: called from KVM's kvm_vcpu_block() right before it bails
+ * out due to a pending signal. Captures the userspace pt_regs so the clone
+ * can re-iret to the ioctl(KVM_RUN) syscall instruction (instead of
+ * returning at futex_wait inside pthread_cond_wait, where QEMU masks
+ * SIGUSR1 and the guest never gets kicked).
+ *
+ * We rewrite two fields in the saved frame:
+ *   - ip -= 2  : rewind past the 'syscall' instruction so iret re-enters it
+ *   - ax = orig_ax : entry_SYSCALL_64 clobbered ax to -ENOSYS, restore the
+ *                    syscall number so user rax is correct at re-entry
+ *
+ * Runs in the vCPU thread's own context; sf_vcpu_snap was pre-allocated by
+ * the superfork caller before freezing. No locking needed — only this task
+ * reads and writes its own snap, and it only fires once per snap lifecycle
+ * (valid guards re-entry).
+ */
+void superfork_kvm_vcpu_snapshot_entry(void)
+{
+    struct sf_vcpu_snap *snap = READ_ONCE(current->sf_vcpu_snap);
+    struct pt_regs      *regs;
+
+    if (!snap || READ_ONCE(snap->valid))
+        return;
+
+    regs = task_pt_regs(current);
+    if (!regs || !user_mode(regs))
+        return;
+
+    snap->saved_regs      = *regs;
+    snap->saved_regs.ip  -= 2;
+    snap->saved_regs.ax   = snap->saved_regs.orig_ax;
+
+    /* Publish valid=true only after saved_regs is fully written. */
+    smp_wmb();
+    WRITE_ONCE(snap->valid, true);
+}
+EXPORT_SYMBOL_GPL(superfork_kvm_vcpu_snapshot_entry);
+
+/*
+ * Attach a fresh sf_vcpu_snap to every thread in every target tgid. Called
+ * before cgroup_freeze_sync so the snap is in place when KVM's block loop
+ * notices the freezer signal. Non-vCPU threads never trigger the snapshot
+ * hook and their snap stays valid=false — harmless.
+ */
+static void superfork_free_vcpu_snaps(pid_t *kpids, size_t count);
+
+static int superfork_alloc_vcpu_snaps(pid_t *kpids, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        struct task_struct *leader, *thread;
+
+        rcu_read_lock();
+        leader = find_task_by_vpid(kpids[i]);
+        if (!leader || leader->tgid != kpids[i]) {
+            rcu_read_unlock();
+            pr_warn("superfork: alloc_vcpu_snaps: tgid %d not found\n",
+                    kpids[i]);
+            goto err;
+        }
+
+        for_each_thread(leader, thread) {
+            struct sf_vcpu_snap *snap;
+
+            if (READ_ONCE(thread->sf_vcpu_snap))
+                continue;
+
+            /* GFP_ATOMIC under rcu_read_lock; snap is small (~pt_regs). */
+            snap = kzalloc(sizeof(*snap), GFP_ATOMIC);
+            if (!snap) {
+                rcu_read_unlock();
+                pr_err("superfork: alloc_vcpu_snaps: kzalloc OOM\n");
+                goto err;
+            }
+
+            /*
+             * Publish the pointer. The task isn't frozen yet so it may
+             * observe this on its next KVM block-check; that's fine.
+             */
+            WRITE_ONCE(thread->sf_vcpu_snap, snap);
+        }
+        rcu_read_unlock();
+    }
+
+    return 0;
+
+err:
+    superfork_free_vcpu_snaps(kpids, count);
+    return -ENOMEM;
+}
+
+/*
+ * Detach and free sf_vcpu_snap from every thread in the target tgids.
+ * Idempotent: safe to call on error paths even if alloc partially ran.
+ */
+static void superfork_free_vcpu_snaps(pid_t *kpids, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        struct task_struct *leader, *thread;
+
+        rcu_read_lock();
+        leader = find_task_by_vpid(kpids[i]);
+        if (!leader || leader->tgid != kpids[i]) {
+            rcu_read_unlock();
+            continue;
+        }
+
+        for_each_thread(leader, thread) {
+            struct sf_vcpu_snap *snap = xchg(&thread->sf_vcpu_snap, NULL);
+            kfree(snap);
+        }
+        rcu_read_unlock();
     }
 }
 
@@ -3313,16 +3834,13 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 	superfork_attach_tasks(ctx);
 
 	/*
-	 * Seed cloned tasks into valid css_set/cg_list state before migrating
-	 * them to the destination cgroup.
+	 * Cgroup seeding and post-fork setup are deferred to the caller so
+	 * they run after the source cgroup has been thawed. Seeding clones
+	 * into a frozen src_cgrp would leave __cgroup_task_count >
+	 * nr_frozen_tasks, flip CGRP_FROZEN off prematurely, short-circuit
+	 * cgroup_thaw_sync, and leave the source tasks' JOBCTL_TRAP_FREEZE
+	 * set. See superfork_do_clone() for the post-thaw call sites.
 	 */
-	ret = superfork_seed_cgroup_membership(ctx);
-	if (ret < 0)
-		goto cleanup_after_leaders;
-
-	/* Phase 5: Post-fork setup */
-	superfork_post_fork(ctx);
-
 	return new_init_pid;
 
 cleanup_after_leaders:
@@ -3622,8 +4140,12 @@ SYSCALL_DEFINE4(superfork,
 	struct container_clone_ctx *ctx;
 	struct container_config *config;
 	struct cgroup *src_cgrp = NULL;
+	struct sf_src_cgroup_move *src_moves = NULL;
 	pid_t *kpids;
 	pid_t new_init_pid = 0;
+	bool src_cgrp_frozen = false;
+	int thaw_ret;
+	int restore_ret;
 	int ret = 0;
 
 	pr_info("superfork: starting with %zu pids\n", count);
@@ -3655,17 +4177,24 @@ SYSCALL_DEFINE4(superfork,
 		goto out_free_ctx;
 	}
 
+	src_moves = kcalloc(count, sizeof(*src_moves), GFP_KERNEL);
+	if (!src_moves) {
+		ret = -ENOMEM;
+		goto out_free_kpids;
+	}
+
 	if (copy_from_user(kpids, pids, count * sizeof(pid_t))) {
 		pr_err("superfork: copy_from_user pids failed\n");
 		ret = -EFAULT;
-		goto out_free_kpids;
+		goto out_cleanup;
 	}
 	pr_info("superfork: pids copied, first=%d\n", kpids[0]);
 
 	/*
-	 * Freeze the source cgroup before collecting tasks so no threads
-	 * can be created or destroyed under us during the clone phase.
-	 * cgroup_freeze_sync() blocks until all tasks are in TASK_FROZEN.
+	 * Resolve the scratch/destination cgroup that will be frozen. The
+	 * source tasks are migrated into this cgroup before freezing so the
+	 * freeze affects only the tasks being cloned, not whatever cgroup
+	 * the caller happened to live in (e.g. a shared user session scope).
 	 */
 	src_cgrp = cgroup_get_from_path(config->src_cgroup_path);
 	if (IS_ERR(src_cgrp)) {
@@ -3673,28 +4202,50 @@ SYSCALL_DEFINE4(superfork,
 		       config->src_cgroup_path, PTR_ERR(src_cgrp));
 		ret = PTR_ERR(src_cgrp);
 		src_cgrp = NULL;
-		goto out_free_kpids;
+		goto out_cleanup;
 	}
 	pr_info("superfork: got src_cgrp for '%s'\n", config->src_cgroup_path);
+
+	/*
+	 * Record each source leader's current cgroup and migrate it into
+	 * src_cgrp. Original membership is restored on exit so the source
+	 * container keeps its original cgroup placement.
+	 */
+	ret = superfork_prepare_source_task_cgroups(src_cgrp, kpids, count,
+						     src_moves);
+	if (ret < 0)
+		goto out_cleanup;
+
+	/*
+	 * Pre-allocate per-thread pt_regs snapshot slots before freezing so
+	 * KVM's block loop can capture the vCPU's userspace frame when the
+	 * freezer signal arrives. See superfork_kvm_vcpu_snapshot_entry().
+	 */
+	ret = superfork_alloc_vcpu_snaps(kpids, count);
+	if (ret < 0) {
+		pr_err("superfork: alloc_vcpu_snaps failed: %d\n", ret);
+		goto out_cleanup;
+	}
 
 	ret = cgroup_freeze_sync(src_cgrp);
 	if (ret < 0) {
 		pr_err("superfork: cgroup_freeze_sync failed: %d\n", ret);
-		goto out_put_src_cgrp;
+		goto out_cleanup;
 	}
+	src_cgrp_frozen = true;
 	pr_info("superfork: src cgroup frozen\n");
 
 	ret = wait_source_tasks_frozen(kpids, count);
 	if (ret < 0) {
 		pr_err("superfork: timed out waiting for source tasks to freeze\n");
-		goto out_thaw;
+		goto out_cleanup;
 	}
 
 	ret = btrfs_snapshot(user_config, config->dst_bundle_path);
 	if (ret < 0) {
 		pr_err("superfork: btrfs_snapshot('%s' -> '%s') failed: %d\n",
 		       config->src_bundle_path, config->dst_bundle_path, ret);
-		goto out_thaw;
+		goto out_cleanup;
 	}
 	pr_info("superfork: snapshot created '%s' -> '%s'\n",
 		config->src_bundle_path, config->dst_bundle_path);
@@ -3702,9 +4253,40 @@ SYSCALL_DEFINE4(superfork,
 	ret = clone_container(ctx, kpids, count, config, &new_init_pid);
 	if (ret < 0) {
 		pr_err("superfork: clone_container failed: %d\n", ret);
-		goto out_thaw;
+		goto out_cleanup;
 	}
 	pr_info("superfork: clone_container done, new_init_pid=%d\n", new_init_pid);
+
+	/*
+	 * Thaw the source cgroup before waking cloned tasks so the source
+	 * VM resumes cleanly once clone_container() completes.
+	 */
+	ret = superfork_thaw_source_cgroup_sync(src_cgrp, "post-clone");
+	if (ret < 0)
+		goto out_destroy_container;
+	src_cgrp_frozen = false;
+
+	restore_ret = superfork_restore_source_task_cgroups(src_moves, count);
+	if (restore_ret < 0) {
+		ret = restore_ret;
+		goto out_destroy_container;
+	}
+
+	/*
+	 * Seed cloned tasks into their destination css_set now that src_cgrp
+	 * is thawed. Doing this while src_cgrp was frozen would bump
+	 * __cgroup_task_count without bumping nr_frozen_tasks, breaking the
+	 * freezer invariant and causing cgroup_leave_frozen() underflows on
+	 * both the source and the clones.
+	 */
+	ret = superfork_seed_cgroup_membership(ctx);
+	if (ret < 0) {
+		pr_err("superfork: seed_cgroup_membership failed: %d\n", ret);
+		goto out_destroy_container;
+	}
+
+	/* Phase 5: Post-fork setup (must run after cgroup seeding). */
+	superfork_post_fork(ctx);
 
 	if (copy_to_user(user_new_init_pid, &new_init_pid, sizeof(pid_t))) {
 		pr_err("superfork: copy_to_user new_init_pid failed\n");
@@ -3716,12 +4298,30 @@ SYSCALL_DEFINE4(superfork,
 	pr_info("superfork: Phase 4 - waking tasks\n");
 	superfork_wake_tasks(ctx);
 
+	ret = 0;
+	goto out_cleanup;
+
+out_destroy_container:
+	superfork_destroy_container(ctx);
+
+out_cleanup:
+	if (src_cgrp_frozen) {
+		thaw_ret = superfork_thaw_source_cgroup_sync(src_cgrp, "cleanup");
+		if (!ret && thaw_ret < 0)
+			ret = thaw_ret;
+		src_cgrp_frozen = false;
+	}
 
 	/*
-	 * Thaw the source cgroup now that cloning is complete and the
-	 * new container's tasks are running.
+	 * Free per-thread pt_regs snapshot slots. Idempotent: safe even if
+	 * alloc failed or never ran. Must run after source tasks are thawed
+	 * so they don't observe a stale pointer if they re-enter KVM_RUN.
 	 */
-	cgroup_thaw_sync(src_cgrp);
+	superfork_free_vcpu_snaps(kpids, count);
+
+	restore_ret = superfork_restore_source_task_cgroups(src_moves, count);
+	if (!ret && restore_ret < 0)
+		ret = restore_ret;
 
 	release_collected_tasks(ctx);
 	if (ctx->new_nsproxy)
@@ -3732,26 +4332,13 @@ SYSCALL_DEFINE4(superfork,
 		put_nsproxy(ctx->src_nsproxy);
 	if (ctx->src_pid_ns)
 		put_pid_ns(ctx->src_pid_ns);
-	cgroup_put(src_cgrp);
-	kfree(kpids);
-	kvfree(ctx);
-	kfree(config);
-	return 0;
 
-out_destroy_container:
-	superfork_destroy_container(ctx);
-	cgroup_thaw_sync(src_cgrp);
-	cgroup_put(src_cgrp);
-	kfree(kpids);
-	kvfree(ctx);
-	kfree(config);
-	return ret;
+	if (src_cgrp)
+		cgroup_put(src_cgrp);
 
-out_thaw:
-	cgroup_thaw_sync(src_cgrp);
-
-out_put_src_cgrp:
-	cgroup_put(src_cgrp);
+	superfork_put_source_task_cgroup_moves(src_moves, count);
+	kfree(src_moves);
+	src_moves = NULL;
 
 out_free_kpids:
 	kfree(kpids);

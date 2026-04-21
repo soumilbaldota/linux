@@ -659,6 +659,29 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+int kvm_superfork_copy_cpuid(struct kvm_vcpu *dst, struct kvm_vcpu *src)
+{
+	struct kvm_cpuid_entry2 *e2;
+	int nent = src->arch.cpuid_nent;
+	int r;
+
+	if (!nent)
+		return 0;
+
+	e2 = kvmalloc_array(nent, sizeof(*e2), GFP_KERNEL_ACCOUNT);
+	if (!e2)
+		return -ENOMEM;
+
+	memcpy(e2, src->arch.cpuid_entries, nent * sizeof(*e2));
+
+	r = kvm_set_cpuid(dst, e2, nent);
+	if (r)
+		kvfree(e2);
+
+	return r;
+}
+EXPORT_SYMBOL_GPL(kvm_superfork_copy_cpuid);
+
 static __always_inline u32 raw_cpuid_get(struct cpuid_reg cpuid)
 {
 	struct kvm_cpuid_entry2 entry;

@@ -8,6 +8,7 @@
 #include <linux/fs_struct.h>
 #include <linux/user_namespace.h>
 #include <linux/btrfs.h>
+#include <asm/ptrace.h>
 
 struct task_struct;
 struct signal_struct;
@@ -18,6 +19,21 @@ struct fs_struct;
 struct file;
 struct kvm;
 struct kvm_vcpu;
+
+/*
+ * Snapshot of a vCPU thread's userspace pt_regs, captured at the moment KVM
+ * is about to bounce it out of kvm_vcpu_block() due to a freezer signal.
+ * Used by superfork to make the clone re-enter ioctl(KVM_RUN) instead of
+ * returning to userspace at futex_wait (where QEMU would park in
+ * pthread_cond_wait and never deliver SIGUSR1 because it's masked there).
+ */
+struct sf_vcpu_snap {
+	struct pt_regs	saved_regs;
+	bool		valid;
+};
+
+/* Called from KVM's kvm_vcpu_block() when about to exit due to signal. */
+void superfork_kvm_vcpu_snapshot_entry(void);
 
 
 /* Implemented in arch/{arm64,x86}/kernel/superfork_process.c */

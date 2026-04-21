@@ -1068,6 +1068,16 @@ bool kvm_get_kvm_safe(struct kvm *kvm);
 void kvm_put_kvm(struct kvm *kvm);
 bool file_is_kvm(struct file *file);
 bool file_is_kvm_vcpu(struct file *file);
+bool file_is_kvm_vcpu_stats(struct file *file);
+bool file_is_kvm_vm_stats(struct file *file);
+bool file_is_kvm_device(struct file *file);
+#ifdef CONFIG_KVM_GUEST_MEMFD
+bool file_is_kvm_gmem(struct file *file);
+#else
+static inline bool file_is_kvm_gmem(struct file *file) { return false; }
+#endif
+struct file *kvm_vcpu_stats_file_create(struct kvm_vcpu *vcpu);
+struct file *kvm_vm_stats_file_create(struct kvm *kvm);
 void kvm_put_kvm_no_destroy(struct kvm *kvm);
 unsigned long kvm_arch_superfork_vm_type(struct kvm *kvm);
 unsigned long kvm_superfork_get_vm_type(struct kvm *kvm);
@@ -1082,6 +1092,12 @@ int kvm_superfork_set_memslot(struct kvm *kvm,
 			      const struct kvm_userspace_memory_region2 *mem);
 int kvm_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
 				  struct kvm_vcpu *src);
+int kvm_arch_superfork_copy_vcpu_state(struct kvm_vcpu *dst,
+				       struct kvm_vcpu *src);
+int kvm_arch_superfork_prepare_vm(struct kvm *dst, struct kvm *src);
+int kvm_arch_superfork_finalize_vm(struct kvm *dst, struct kvm *src);
+int kvm_superfork_prepare_vm(struct kvm *dst, struct kvm *src);
+int kvm_superfork_finalize_vm(struct kvm *dst, struct kvm *src);
 
 static inline struct kvm_memslots *__kvm_memslots(struct kvm *kvm, int as_id)
 {
