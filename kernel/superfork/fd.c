@@ -707,8 +707,6 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 			if (replacement) {
 				replacement_needs_install = true;
 				replacement_from_map = true;
-				pr_info("superfork: fd %u type=%d hit alias map, skipping clone\n",
-					action.fd, action.type);
 			}
 		}
 

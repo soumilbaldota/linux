@@ -152,8 +152,6 @@ static void superfork_remap_kvm_vcpu_vma(struct mm_struct *new_mm,
 	}
 	mmap_write_unlock(new_mm);
 
-	pr_info("superfork: kvm_run VMA remap: scanned=%d found=%d (src=%p new=%p)\n",
-		scanned, found, src_file, new_vcpu_file);
 	if (!found)
 		pr_warn("superfork: kvm_run VMA not found for vcpu fd remap\n");
 }
@@ -186,9 +184,17 @@ int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 	if (ret)
 		return ret;
 
-	/* Tell QEMU the ioctl was interrupted by a signal so it loops back
+	/*
+	 * Tell QEMU the ioctl was interrupted by a signal so it loops back
 	 * and re-issues KVM_RUN rather than treating exit_reason=0 as an
-	 * unknown hardware exit and stopping the VM. */
+	 * unknown hardware exit and stopping the VM.
+	 *
+	 * KVM_EXIT_INTR means "ioctl(KVM_RUN) returned -EINTR" — QEMU handles
+	 * it by re-entering the KVM_RUN loop immediately.  The paired fix is
+	 * in superfork_copy_thread: if the vCPU thread has a valid vcpu_snap,
+	 * the clone's pt_regs are set so iret lands back at the 'syscall'
+	 * instruction for KVM_RUN rather than at wherever the thread was parked.
+	 */
 	new_vcpu->run->exit_reason = KVM_EXIT_INTR;
 
 	ret = kvm_superfork_copy_vcpu_state(new_vcpu, src_vcpu);
@@ -199,8 +205,6 @@ int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 	if (ret)
 		goto out_put_new_vcpu;
 
-	pr_info("superfork: vcpu fd %u clone done, new_mm=%p src_file=%p new_vcpu_file=%p\n",
-		fd, new_mm, src_file, new_vcpu_file);
 	if (new_mm)
 		superfork_remap_kvm_vcpu_vma(new_mm, src_file, new_vcpu_file);
 	else

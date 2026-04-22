@@ -331,6 +331,16 @@ static inline int thread_user_mode(struct task_struct *thread)
 #define SUPERFORK_FREEZE_WAIT_RETRIES 2000
 #define SUPERFORK_FREEZE_WAIT_MS      5
 
+/*
+ * A thread is ready to clone when it is both frozen/stopped AND its saved
+ * register frame points into userspace.  The userspace check is load-bearing:
+ * if the saved RIP is inside kernel code, superfork_copy_thread would set up
+ * a clone that resumes mid-kernel-function with a stale stack.
+ *
+ * vhost_tasks (PF_USER_WORKER) satisfy user_mode() after the cgroup freezer
+ * kicks them out of kvm_vcpu_block.  Plain PF_KTHREAD tasks are handled
+ * separately in superfork_copy_kthread and bypass this check.
+ */
 static bool thread_ready_for_clone(struct task_struct *thread)
 {
 	if (!cgroup_task_frozen(thread) &&

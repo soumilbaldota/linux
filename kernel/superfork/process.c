@@ -105,7 +105,11 @@ static int superfork_copy_files(struct task_struct *p,
 	}
 
 	if (clone_flags & CLONE_FILES) {
-		/* Thread: share the CLONED leader's files, not the original's */
+		/*
+		 * Thread: share the CLONED leader's files, not the original's.
+		 * Sharing the original would give the thread access to the source
+		 * container's fds, breaking isolation.
+		 */
 		if (!tgid_entry->shared_files)
 			return -EINVAL;
 		atomic_inc(&tgid_entry->shared_files->count);
@@ -495,6 +499,11 @@ struct task_struct *superfork_copy_process(
 	const char *fail_stage = "none";
 
 	/* Set clone flags based on whether this is a leader or thread */
+	/*
+	 * Threads share the leader's mm/files/sighand via CLONE_VM|FILES|SIGHAND.
+	 * The leader's superfork_copy_process call stores these in tgid_entry
+	 * so non-leader calls can reference them.
+	 */
 	if (!is_leader)
 		clone_flags = CLONE_THREAD | CLONE_VM |
 			      CLONE_FILES | CLONE_SIGHAND;

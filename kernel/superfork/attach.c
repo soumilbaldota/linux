@@ -289,6 +289,10 @@ void superfork_wake_tasks(struct container_clone_ctx *ctx)
 	 * Wake non-leaders first (futex/sleep threads) before the leader.
 	 * The leader may be in ppoll and waking it first could cause it to
 	 * generate signals to threads before they are ready to receive them.
+	 *
+	 * After wake_up_new_task() the clone is on a runqueue and may begin
+	 * executing immediately.  All cgroup and scheduler setup (post_fork,
+	 * seed_cgroup_membership) must be complete before this point.
 	 */
 
 	/* Pass 1: non-leader threads */
@@ -325,14 +329,6 @@ void superfork_wake_tasks(struct container_clone_ctx *ctx)
 			bool pstate_ok = ((pstate & PSR_MODE_MASK) == PSR_MODE_EL0t);
 			bool sp_ok = (regs->sp < TASK_SIZE);
 			bool pc_ok = (regs->pc < TASK_SIZE);
-
-			pr_info("superfork: waking thread pid=%d pc=0x%llx sp=0x%llx "
-				"pstate=0x%llx fp_type=%d sve=%d "
-				"pstate_ok=%d sp_ok=%d pc_ok=%d\n",
-				p->pid, regs->pc, regs->sp, pstate,
-				p->thread.fp_type,
-				test_tsk_thread_flag(p, TIF_SVE) ? 1 : 0,
-				pstate_ok, sp_ok, pc_ok);
 
 			if (!pstate_ok || !sp_ok || !pc_ok) {
 				pr_err("superfork: CORRUPT regs on pid=%d — skipping wake\n",
@@ -374,14 +370,6 @@ void superfork_wake_tasks(struct container_clone_ctx *ctx)
 			bool pstate_ok = ((pstate & PSR_MODE_MASK) == PSR_MODE_EL0t);
 			bool sp_ok = (regs->sp < TASK_SIZE);
 			bool pc_ok = (regs->pc < TASK_SIZE);
-
-			pr_info("superfork: waking leader pid=%d pc=0x%llx sp=0x%llx "
-				"pstate=0x%llx fp_type=%d sve=%d "
-				"pstate_ok=%d sp_ok=%d pc_ok=%d\n",
-				p->pid, regs->pc, regs->sp, pstate,
-				p->thread.fp_type,
-				test_tsk_thread_flag(p, TIF_SVE) ? 1 : 0,
-				pstate_ok, sp_ok, pc_ok);
 
 			if (!pstate_ok || !sp_ok || !pc_ok) {
 				pr_err("superfork: CORRUPT regs on pid=%d — skipping wake\n",

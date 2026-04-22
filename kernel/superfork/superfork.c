@@ -136,8 +136,6 @@ static int superfork_setup_container_namespaces(struct container_clone_ctx *ctx,
 	struct pid_namespace *parent_ns;
 	struct nsproxy *src_nsproxy;
 
-	pr_info("superfork: setting up container namespaces\n");
-
 	/* Validate input */
 	if (!first_task) {
 		pr_err("superfork: invalid source task\n");
@@ -221,7 +219,6 @@ static int superfork_setup_container_namespaces(struct container_clone_ctx *ctx,
 	put_pid_ns(ctx->new_nsproxy->pid_ns_for_children);
 	ctx->new_nsproxy->pid_ns_for_children = get_pid_ns(ctx->new_pid_ns);
 
-	pr_info("superfork: namespace setup complete\n");
 	pr_debug("  Namespaces in new container:\n");
 	pr_debug("    PID ns:   %p (NEW)\n", ctx->new_nsproxy->pid_ns_for_children);
 	pr_debug("    Mount ns: %p (NEW)\n", ctx->new_nsproxy->mnt_ns);
@@ -250,6 +247,16 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 		ret = -ESRCH;
 		goto out;
 	}
+
+	/*
+	 * Two-pass clone: leaders first, then threads.
+	 *
+	 * superfork_copy_process for a leader allocates the shared mm, files,
+	 * signal, and sighand structs and stores them in tgid_entry.  The
+	 * thread pass then references those via CLONE_VM|FILES|SIGHAND|THREAD
+	 * instead of duplicating them again.  Reversing the order would leave
+	 * tgid_entry->shared_* NULL when threads look them up.
+	 */
 
 	/* Phase 2: Clone thread group leaders */
 	for_each_task_in_ctx(ctx) {
@@ -313,8 +320,6 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 		pr_err("superfork: fd verification failed: %d\n", ret);
 		goto cleanup_after_leaders;
 	}
-	pr_info("superfork: fd verification passed\n");
-
 	/* Phase 4: Attach tasks */
 	superfork_attach_tasks(ctx);
 
@@ -643,8 +648,6 @@ SYSCALL_DEFINE4(superfork,
 	int restore_ret;
 	int ret = 0;
 
-	pr_info("superfork: starting with %zu pids\n", count);
-
 	if (count == 0 || count > MAX_CLONE_TGIDS)
 		return -EINVAL;
 
@@ -657,9 +660,6 @@ SYSCALL_DEFINE4(superfork,
 		ret = -EFAULT;
 		goto out_free_config;
 	}
-	pr_info("superfork: config copied, src_cgroup='%s'\n", config->src_cgroup_path);
-	pr_info("superfork: container_clone_ctx size=%zu bytes\n", sizeof(*ctx));
-
 	ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
 		ret = -ENOMEM;
@@ -683,13 +683,14 @@ SYSCALL_DEFINE4(superfork,
 		ret = -EFAULT;
 		goto out_cleanup;
 	}
-	pr_info("superfork: pids copied, first=%d\n", kpids[0]);
-
 	/*
 	 * Resolve the scratch/destination cgroup that will be frozen. The
 	 * source tasks are migrated into this cgroup before freezing so the
 	 * freeze affects only the tasks being cloned, not whatever cgroup
 	 * the caller happened to live in (e.g. a shared user session scope).
+	 *
+	 * src_cgrp is also the *destination* cgroup for the clones — they
+	 * stay here after the sources are moved back to their originals.
 	 */
 	src_cgrp = cgroup_get_from_path(config->src_cgroup_path);
 	if (IS_ERR(src_cgrp)) {
@@ -755,6 +756,15 @@ SYSCALL_DEFINE4(superfork,
 	/*
 	 * Thaw the source cgroup before waking cloned tasks so the source
 	 * VM resumes cleanly once clone_container() completes.
+	 *
+	 * ORDER MATTERS for the next four calls:
+	 *   thaw → restore sources → seed clones → post_fork → wake
+	 *
+	 * Seeding clones while src_cgrp is still frozen would flip CGRP_FROZEN
+	 * off prematurely (bumping __cgroup_task_count without nr_frozen_tasks),
+	 * causing cgroup_thaw_sync to short-circuit and leaving source threads
+	 * trapped with JOBCTL_TRAP_FREEZE.  See the freezer invariant note in
+	 * docs/superfork-code-flow.md for the full analysis.
 	 */
 	ret = superfork_thaw_source_cgroup_sync(src_cgrp, "post-clone");
 	if (ret < 0)

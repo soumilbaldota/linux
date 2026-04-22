@@ -11612,10 +11612,7 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		if (kvm_vcpu_running(vcpu)) {
 			r = vcpu_enter_guest(vcpu);
 		} else {
-			pr_err_ratelimited("SUPERFORK: vcpu_run calling vcpu_block mp_state=%d\n", vcpu->arch.mp_state);
 			r = vcpu_block(vcpu);
-			if (r <= 0)
-				pr_err_ratelimited("SUPERFORK: vcpu_block returned r=%d\n", r);
 		}
 
 		if (r <= 0)
