@@ -3,7 +3,7 @@
 # Makefile for the linux kernel.
 #
 
-obj-y     = superfork.o fork.o exec_domain.o panic.o \
+obj-y     = superfork/ fork.o exec_domain.o panic.o \
 	    cpu.o exit.o softirq.o resource.o \
 	    sysctl.o capability.o ptrace.o user.o \
 	    signal.o sys.o umh.o workqueue.o pid.o task_work.o \

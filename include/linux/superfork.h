@@ -35,11 +35,10 @@ struct sf_vcpu_snap {
 /* Called from KVM's kvm_vcpu_block() when about to exit due to signal. */
 void superfork_kvm_vcpu_snapshot_entry(void);
 
-
 /* Implemented in arch/{arm64,x86}/kernel/superfork_process.c */
 int superfork_copy_thread(struct task_struct *p,
-                          struct task_struct *src_task,
-                          u64 clone_flags);
+			  struct task_struct *src_task,
+			  u64 clone_flags);
 
 /* From fork.c - task allocation */
 struct task_struct *alloc_task_struct_node(int node);
@@ -73,32 +72,37 @@ struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
 int cgroup_superfork_attach(struct task_struct *new_task,
 			    struct task_struct *src_task);
 
+/* From fork.c */
+extern struct mm_struct *dup_mm(struct task_struct *tsk, struct mm_struct *oldmm);
+extern struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid, size_t set_tid_size);
+extern struct kmem_cache *sighand_cachep;
+
 /*
  * Container configuration for superfork_create
  */
 struct container_config {
-    char container_id[64];
-    char cgroup_path[256];
-    char src_cgroup_path[256];
-    char src_bundle_path[4096];
-    char dst_bundle_path[4096];
-    char new_rootfs_path[4096];
-    struct btrfs_ioctl_vol_args_v2 btrfs_args; /* pre-filled by userspace */
-    char pid_ns_path[256];
-    char mnt_ns_path[256];
-    char ipc_ns_path[256];
-    char uts_ns_path[256];
-    char net_ns_path[256];
-    char user_ns_path[256];
-    char cgroup_ns_path[256];
-    uid_t owner_uid;
-    gid_t owner_gid;
-    bool share_namespaces;
+	char container_id[64];
+	char cgroup_path[256];
+	char src_cgroup_path[256];
+	char src_bundle_path[4096];
+	char dst_bundle_path[4096];
+	char new_rootfs_path[4096];
+	struct btrfs_ioctl_vol_args_v2 btrfs_args; /* pre-filled by userspace */
+	char pid_ns_path[256];
+	char mnt_ns_path[256];
+	char ipc_ns_path[256];
+	char uts_ns_path[256];
+	char net_ns_path[256];
+	char user_ns_path[256];
+	char cgroup_ns_path[256];
+	uid_t owner_uid;
+	gid_t owner_gid;
+	bool share_namespaces;
 };
 
-#define MAX_CLONE_TASKS 256
-#define MAX_CLONE_TGIDS 64
-#define SUPERFORK_WAKE_TASKS 1
+#define MAX_CLONE_TASKS         256
+#define MAX_CLONE_TGIDS         64
+#define SUPERFORK_WAKE_TASKS    1
 #define SF_MAX_KVM_VMS_PER_PROC 8
 #define SF_MAX_KVM_VCPUS_PER_VM 512
 
@@ -154,25 +158,23 @@ struct container_clone_ctx {
 	int tgid_count;
 };
 
-
 #define for_each_task_in_ctx(ctx) \
-    for ( int i = 0; i < ctx->task_count; i++ )
+	for (int i = 0; i < ctx->task_count; i++)
 
-
-/* Forward declarations for functions exported from fork.c */
-extern struct task_struct *superfork_dup_task_struct(struct task_struct *orig, int node);
-extern void superfork_free_task_struct(struct task_struct *tsk);
-extern void superfork_rt_mutex_init_task(struct task_struct *p);
-extern void superfork_rcu_copy_process(struct task_struct *p);
-extern void superfork_account_new_task(bool is_leader);
-extern struct mm_struct *dup_mm(struct task_struct *tsk, struct mm_struct *oldmm);
-extern struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid, size_t set_tid_size);
-extern struct kmem_cache *sighand_cachep;
-
-#endif /* _LINUX_SUPERFORK_H */
+/* From process.c - called by superfork_clone_processes */
+struct task_struct *superfork_copy_process(
+	struct container_clone_ctx *ctx,
+	struct task_struct *src_task,
+	struct tgid_clone_entry *tgid_entry,
+	const char *new_rootfs_path,
+	const char *src_bundle_path,
+	const char *dst_bundle_path,
+	bool is_leader);
 
 #ifdef CONFIG_TASK_XACCT
 void acct_clear_integrals(struct task_struct *tsk);
 #else
 static inline void acct_clear_integrals(struct task_struct *tsk) { }
 #endif
+
+#endif /* _LINUX_SUPERFORK_H */
