@@ -81,6 +81,8 @@
 #include <uapi/linux/un.h>
 #include <linux/eventfd.h>
 #include <linux/signalfd.h>
+#define CREATE_TRACE_POINTS
+#include <trace/events/superfork.h>
 #include "internal.h"
 
 /* ---- utilities used only within this file ------------------------------ */
@@ -96,6 +98,12 @@ static struct nsproxy *superfork_get_task_nsproxy(struct task_struct *task)
 	task_unlock(task);
 
 	return nsproxy;
+}
+
+static inline void superfork_trace_phase(const char *phase, int ret, pid_t pid,
+					 unsigned int count)
+{
+	trace_superfork_phase(phase, ret, pid, count);
 }
 
 /* ---- tgid entry map ---------------------------------------------------- */
@@ -270,10 +278,13 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 		}
 
 		task->new_task = new_task;
+		trace_superfork_task_clone(task->old_task->pid, task->old_tgid,
+					 new_task->pid, true);
 
 		if (new_init_pid == 0)
 			new_init_pid = new_task->pid;
 	}
+	superfork_trace_phase("clone_leaders", 0, new_init_pid, ctx->task_count);
 
 	/* Phase 3: Clone non-leader threads */
 	for_each_task_in_ctx(ctx) {
@@ -298,15 +309,20 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 		}
 
 		task->new_task = new_task;
+		trace_superfork_task_clone(task->old_task->pid, task->old_tgid,
+					 new_task->pid, false);
 	}
+	superfork_trace_phase("clone_threads", 0, new_init_pid, ctx->task_count);
 
 	ret = superfork_verify_cloned_fds(ctx);
+	superfork_trace_phase("verify_fds", ret, new_init_pid, ctx->task_count);
 	if (ret < 0) {
 		pr_err("superfork: fd verification failed: %d\n", ret);
 		goto cleanup_after_leaders;
 	}
 	/* Phase 4: Attach tasks */
 	superfork_attach_tasks(ctx);
+	superfork_trace_phase("attach_tasks", 0, new_init_pid, ctx->task_count);
 
 	/*
 	 * Cgroup seeding and post-fork setup are deferred to the caller so
@@ -319,6 +335,8 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 	return new_init_pid;
 
 cleanup_after_leaders:
+	superfork_trace_phase("clone_processes_failed", ret, new_init_pid,
+			       ctx->task_count);
 	write_lock_irq(&tasklist_lock);
 	for_each_task_in_ctx(ctx) {
 		struct task_clone_entry *task = get_ctx_task(ctx, i);
@@ -438,6 +456,7 @@ static int clone_container(struct container_clone_ctx *ctx,
 	pr_debug("superfork: Phase 0 - collecting frozen tasks\n");
 
 	ret = collect_frozen_tasks(ctx, kpids, count);
+	superfork_trace_phase("collect_frozen_tasks", ret, 0, ctx->task_count);
 
 	if (ret < 0) {
 		pr_err("superfork: failed to collect frozen tasks: %d\n", ret);
@@ -457,6 +476,8 @@ static int clone_container(struct container_clone_ctx *ctx,
 	}
 
 	ret = superfork_setup_container_namespaces(ctx, first_frozen_task);
+	superfork_trace_phase("setup_namespaces", ret, first_frozen_task->pid,
+			       ctx->task_count);
 	if (ret < 0) {
 		pr_err("superfork: namespace setup failed: %d\n", ret);
 		goto cleanup_final;
@@ -467,12 +488,15 @@ static int clone_container(struct container_clone_ctx *ctx,
 
 	init_pid = superfork_clone_processes(ctx, config->src_bundle_path,
 					    config->dst_bundle_path);
+	superfork_trace_phase("clone_processes", init_pid < 0 ? init_pid : 0,
+			       init_pid < 0 ? 0 : init_pid, ctx->task_count);
 	if (init_pid < 0) {
 		ret = init_pid;
 		goto cleanup_destroy;
 	}
 
 	*new_init_pid = init_pid;
+	superfork_trace_phase("container_created", 0, init_pid, ctx->task_count);
 
 	pr_info("superfork: container created successfully, init=%d\n", init_pid);
 
@@ -484,11 +508,13 @@ static int clone_container(struct container_clone_ctx *ctx,
 
 cleanup_destroy:
 	pr_warn("superfork: destroying partially created container\n");
+	superfork_trace_phase("destroy_container", ret, 0, ctx->task_count);
 	superfork_destroy_container(ctx);
 	return ret;
 
 cleanup_final:
 	pr_warn("superfork: cleaning up after early failure\n");
+	superfork_trace_phase("cleanup_early_failure", ret, 0, ctx->task_count);
 
 	release_collected_tasks(ctx);
 
@@ -687,6 +713,7 @@ SYSCALL_DEFINE4(superfork,
 	 */
 	ret = superfork_prepare_source_task_cgroups(src_cgrp, kpids, count,
 						     src_moves);
+	superfork_trace_phase("prepare_source_cgroups", ret, 0, count);
 	if (ret < 0)
 		goto out_cleanup;
 
@@ -696,12 +723,14 @@ SYSCALL_DEFINE4(superfork,
 	 * freezer signal arrives. See superfork_kvm_vcpu_snapshot_entry().
 	 */
 	ret = superfork_alloc_vcpu_snaps(kpids, count);
+	superfork_trace_phase("alloc_vcpu_snaps", ret, 0, count);
 	if (ret < 0) {
 		pr_err("superfork: alloc_vcpu_snaps failed: %d\n", ret);
 		goto out_cleanup;
 	}
 
 	ret = cgroup_freeze_sync(src_cgrp);
+	superfork_trace_phase("freeze_source_cgroup", ret, 0, count);
 	if (ret < 0) {
 		pr_err("superfork: cgroup_freeze_sync failed: %d\n", ret);
 		goto out_cleanup;
@@ -710,12 +739,14 @@ SYSCALL_DEFINE4(superfork,
 	pr_info("superfork: src cgroup frozen\n");
 
 	ret = wait_source_tasks_frozen(kpids, count);
+	superfork_trace_phase("wait_source_frozen", ret, 0, count);
 	if (ret < 0) {
 		pr_err("superfork: timed out waiting for source tasks to freeze\n");
 		goto out_cleanup;
 	}
 
 	ret = btrfs_snapshot(user_config, config->dst_bundle_path);
+	superfork_trace_phase("btrfs_snapshot", ret, 0, count);
 	if (ret < 0) {
 		pr_err("superfork: btrfs_snapshot('%s' -> '%s') failed: %d\n",
 		       config->src_bundle_path, config->dst_bundle_path, ret);
@@ -725,6 +756,8 @@ SYSCALL_DEFINE4(superfork,
 		config->src_bundle_path, config->dst_bundle_path);
 
 	ret = clone_container(ctx, kpids, count, config, &new_init_pid);
+	superfork_trace_phase("clone_container", ret, new_init_pid,
+			       ctx->task_count);
 	if (ret < 0) {
 		pr_err("superfork: clone_container failed: %d\n", ret);
 		goto out_cleanup;
@@ -745,11 +778,14 @@ SYSCALL_DEFINE4(superfork,
 	 * docs/superfork-code-flow.md for the full analysis.
 	 */
 	ret = superfork_thaw_source_cgroup_sync(src_cgrp, "post-clone");
+	superfork_trace_phase("thaw_source_cgroup", ret, new_init_pid, count);
 	if (ret < 0)
 		goto out_destroy_container;
 	src_cgrp_frozen = false;
 
 	restore_ret = superfork_restore_source_task_cgroups(src_moves, count);
+	superfork_trace_phase("restore_source_cgroups", restore_ret,
+			       new_init_pid, count);
 	if (restore_ret < 0) {
 		ret = restore_ret;
 		goto out_destroy_container;
@@ -763,6 +799,8 @@ SYSCALL_DEFINE4(superfork,
 	 * both the source and the clones.
 	 */
 	ret = superfork_seed_cgroup_membership(ctx);
+	superfork_trace_phase("seed_cgroup_membership", ret, new_init_pid,
+			       ctx->task_count);
 	if (ret < 0) {
 		pr_err("superfork: seed_cgroup_membership failed: %d\n", ret);
 		goto out_destroy_container;
@@ -770,26 +808,36 @@ SYSCALL_DEFINE4(superfork,
 
 	/* Phase 5: Post-fork setup (must run after cgroup seeding). */
 	superfork_post_fork(ctx);
+	superfork_trace_phase("post_fork", 0, new_init_pid, ctx->task_count);
 
 	if (copy_to_user(user_new_init_pid, &new_init_pid, sizeof(pid_t))) {
 		pr_err("superfork: copy_to_user new_init_pid failed\n");
 		ret = -EFAULT;
+		superfork_trace_phase("copy_new_init_pid", ret, new_init_pid,
+				       ctx->task_count);
 		goto out_destroy_container;
 	}
+	superfork_trace_phase("copy_new_init_pid", 0, new_init_pid,
+			       ctx->task_count);
 	pr_info("superfork: userspace pid copied; waking cloned tasks\n");
 
 	pr_info("superfork: Phase 4 - waking tasks\n");
 	superfork_wake_tasks(ctx);
+	superfork_trace_phase("wake_tasks", 0, new_init_pid, ctx->task_count);
 
 	ret = 0;
 	goto out_cleanup;
 
 out_destroy_container:
+	superfork_trace_phase("destroy_container", ret, new_init_pid,
+			       ctx->task_count);
 	superfork_destroy_container(ctx);
 
 out_cleanup:
 	if (src_cgrp_frozen) {
 		thaw_ret = superfork_thaw_source_cgroup_sync(src_cgrp, "cleanup");
+		superfork_trace_phase("thaw_source_cgroup_cleanup", thaw_ret,
+				       new_init_pid, count);
 		if (!ret && thaw_ret < 0)
 			ret = thaw_ret;
 		src_cgrp_frozen = false;
