@@ -132,8 +132,7 @@ static int superfork_copy_files(struct task_struct *p,
 
 static int superfork_copy_fs(struct task_struct *p,
 			     struct task_struct *src_task,
-			     const char *new_rootfs_path,
-			     u64 clone_flags)
+			     const char *dst_bundle_path)
 {
 	struct fs_struct *fs;
 	struct path new_root, old_root, old_pwd;
@@ -143,12 +142,12 @@ static int superfork_copy_fs(struct task_struct *p,
 	if (!fs)
 		return -ENOMEM;
 
-	if (new_rootfs_path && new_rootfs_path[0] != '\0') {
-		ret = kern_path(new_rootfs_path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
+	if (dst_bundle_path && dst_bundle_path[0] != '\0') {
+		ret = kern_path(dst_bundle_path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
 				&new_root);
 		if (ret) {
-			pr_err("superfork: failed to resolve new rootfs path %s: %d\n",
-			       new_rootfs_path, ret);
+			pr_err("superfork: failed to resolve cloned rootfs path %s: %d\n",
+			       dst_bundle_path, ret);
 			free_fs_struct(fs);
 			return ret;
 		}
@@ -486,7 +485,6 @@ struct task_struct *superfork_copy_process(
 	struct container_clone_ctx *ctx,
 	struct task_struct *src_task,
 	struct tgid_clone_entry *tgid_entry,
-	const char *new_rootfs_path,
 	const char *src_bundle_path,
 	const char *dst_bundle_path,
 	bool is_leader)
@@ -751,7 +749,7 @@ struct task_struct *superfork_copy_process(
 		goto bad_fork_cleanup_mm_only;
 	}
 
-	retval = superfork_copy_fs(p, src_task, new_rootfs_path, clone_flags);
+	retval = superfork_copy_fs(p, src_task, dst_bundle_path);
 	if (retval) {
 		fail_stage = "copy_fs";
 		goto bad_fork_cleanup_files_mm;

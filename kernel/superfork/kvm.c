@@ -100,8 +100,6 @@ int superfork_clone_kvm_vm_fd(struct files_struct *files,
 	if (tgid_entry && tgid_entry->kvm_vm_count < SF_MAX_KVM_VMS_PER_PROC) {
 		int idx = tgid_entry->kvm_vm_count++;
 		tgid_entry->kvm_vms[idx].src_fd = fd;
-		tgid_entry->kvm_vms[idx].src_vm_file = NULL;
-		tgid_entry->kvm_vms[idx].new_vm_file = NULL;
 		tgid_entry->kvm_vms[idx].src_kvm = src_kvm;
 		tgid_entry->kvm_vms[idx].new_kvm = new_kvm;
 	}
@@ -214,7 +212,6 @@ int superfork_clone_kvm_vcpu_fd(struct files_struct *files,
 		int idx = vm_map->vcpu_count++;
 		vm_map->vcpus[idx].src_fd = fd;
 		vm_map->vcpus[idx].vcpu_id = src_vcpu->vcpu_id;
-		vm_map->vcpus[idx].new_file = NULL;
 		vm_map->vcpus[idx].new_vcpu = new_vcpu;
 	}
 

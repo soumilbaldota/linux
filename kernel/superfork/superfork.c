@@ -119,7 +119,6 @@ struct tgid_clone_entry *find_or_create_tgid_entry(
 	ctx->tgids[ctx->tgid_count].shared_signal = NULL;
 	ctx->tgids[ctx->tgid_count].shared_sighand = NULL;
 	ctx->tgids[ctx->tgid_count].shared_files = NULL;
-	ctx->tgids[ctx->tgid_count].shared_fs = NULL;
 
 	return &ctx->tgids[ctx->tgid_count++];
 }
@@ -186,14 +185,9 @@ static int superfork_setup_container_namespaces(struct container_clone_ctx *ctx,
 
 	pr_debug("superfork: created PID namespace %p\n", ctx->new_pid_ns);
 
-	/*
-	 * Always isolate mount/ipc/uts/cgroup and PID namespaces.
-	 * Net namespace isolation may be disabled if source tasks hold sockets.
-	 */
+	/* Always isolate mount/ipc/uts/cgroup/net and PID namespaces. */
 	ns_flags = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS |
-		   CLONE_NEWCGROUP;
-	if (ctx->isolate_netns)
-		ns_flags |= CLONE_NEWNET;
+		   CLONE_NEWCGROUP | CLONE_NEWNET;
 
 	ctx->new_nsproxy = create_new_namespaces(ns_flags, first_task,
 						 user_ns, first_task->fs);
@@ -224,11 +218,7 @@ static int superfork_setup_container_namespaces(struct container_clone_ctx *ctx,
 	pr_debug("    Mount ns: %p (NEW)\n", ctx->new_nsproxy->mnt_ns);
 	pr_debug("    IPC ns:   %p (NEW)\n", ctx->new_nsproxy->ipc_ns);
 	pr_debug("    UTS ns:   %p (NEW)\n", ctx->new_nsproxy->uts_ns);
-	if (ctx->isolate_netns)
-		pr_debug("    Net ns:   %p (NEW)\n", ctx->new_nsproxy->net_ns);
-	else
-		pr_debug("    Net ns:   %p (inherited - sockets detected)\n",
-			 ctx->new_nsproxy->net_ns);
+	pr_debug("    Net ns:   %p (NEW)\n", ctx->new_nsproxy->net_ns);
 
 	return 0;
 }
@@ -236,7 +226,6 @@ static int superfork_setup_container_namespaces(struct container_clone_ctx *ctx,
 /* ---- process clone loop ------------------------------------------------ */
 
 static int superfork_clone_processes(struct container_clone_ctx *ctx,
-				     const char *new_rootfs_path,
 				     const char *src_bundle_path,
 				     const char *dst_bundle_path)
 {
@@ -273,10 +262,8 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 			goto cleanup_after_leaders;
 		}
 
-		new_task = superfork_copy_process(ctx, task->old_task,
-					  tgid_entry, new_rootfs_path,
-					  src_bundle_path, dst_bundle_path,
-					  true);
+		new_task = superfork_copy_process(ctx, task->old_task, tgid_entry,
+					  src_bundle_path, dst_bundle_path, true);
 		if (IS_ERR(new_task)) {
 			ret = PTR_ERR(new_task);
 			goto cleanup_after_leaders;
@@ -303,10 +290,8 @@ static int superfork_clone_processes(struct container_clone_ctx *ctx,
 			goto cleanup_after_leaders;
 		}
 
-		new_task = superfork_copy_process(ctx, task->old_task,
-					  tgid_entry, new_rootfs_path,
-					  src_bundle_path, dst_bundle_path,
-					  false);
+		new_task = superfork_copy_process(ctx, task->old_task, tgid_entry,
+					  src_bundle_path, dst_bundle_path, false);
 		if (IS_ERR(new_task)) {
 			ret = PTR_ERR(new_task);
 			goto cleanup_after_leaders;
@@ -441,11 +426,6 @@ static inline struct task_struct *get_first_ftask(struct container_clone_ctx *ct
 	return NULL;
 }
 
-static void superfork_adjust_netns_isolation(struct container_clone_ctx *ctx)
-{
-	ctx->isolate_netns = true;
-}
-
 static int clone_container(struct container_clone_ctx *ctx,
 			   pid_t *kpids, size_t count,
 			   struct container_config *config,
@@ -470,8 +450,6 @@ static int clone_container(struct container_clone_ctx *ctx,
 		goto cleanup_final;
 	}
 
-	superfork_adjust_netns_isolation(ctx);
-
 	first_frozen_task = get_first_ftask(ctx);
 	if (!first_frozen_task) {
 		ret = -ENOENT;
@@ -484,10 +462,10 @@ static int clone_container(struct container_clone_ctx *ctx,
 		goto cleanup_final;
 	}
 
-	pr_info("superfork: using rootfs path: '%s'\n", config->new_rootfs_path);
+	pr_info("superfork: using cloned bundle rootfs path: '%s'\n",
+		config->dst_bundle_path);
 
-	init_pid = superfork_clone_processes(ctx, config->new_rootfs_path,
-					    config->src_bundle_path,
+	init_pid = superfork_clone_processes(ctx, config->src_bundle_path,
 					    config->dst_bundle_path);
 	if (init_pid < 0) {
 		ret = init_pid;

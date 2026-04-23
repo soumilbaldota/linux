@@ -57,20 +57,9 @@ void superfork_account_new_task(bool is_leader);
 extern struct kmem_cache *signal_cachep;
 void free_signal_struct(struct signal_struct *sig);
 
-/* From nsproxy.c - namespace cloning */
-struct nsproxy *superfork_clone_nsproxy(struct nsproxy *src_nsproxy,
-					struct user_namespace *user_ns,
-					struct pid_namespace *new_pid_ns,
-					struct fs_struct *new_fs,
-					struct mnt_namespace *prepared_mnt_ns);
-
 /* From pid_namespace.c - namespace creation */
 struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
 					   struct pid_namespace *parent_ns);
-
-/* From cgroup.c - cgroup attachment */
-int cgroup_superfork_attach(struct task_struct *new_task,
-			    struct task_struct *src_task);
 
 /* From fork.c */
 extern struct mm_struct *dup_mm(struct task_struct *tsk, struct mm_struct *oldmm);
@@ -78,31 +67,17 @@ extern struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid, size_t se
 extern struct kmem_cache *sighand_cachep;
 
 /*
- * Container configuration for superfork_create
+ * Container configuration for superfork.
  */
 struct container_config {
-	char container_id[64];
-	char cgroup_path[256];
 	char src_cgroup_path[256];
 	char src_bundle_path[4096];
 	char dst_bundle_path[4096];
-	char new_rootfs_path[4096];
 	struct btrfs_ioctl_vol_args_v2 btrfs_args; /* pre-filled by userspace */
-	char pid_ns_path[256];
-	char mnt_ns_path[256];
-	char ipc_ns_path[256];
-	char uts_ns_path[256];
-	char net_ns_path[256];
-	char user_ns_path[256];
-	char cgroup_ns_path[256];
-	uid_t owner_uid;
-	gid_t owner_gid;
-	bool share_namespaces;
 };
 
 #define MAX_CLONE_TASKS         256
 #define MAX_CLONE_TGIDS         64
-#define SUPERFORK_WAKE_TASKS    1
 #define SF_MAX_KVM_VMS_PER_PROC 8
 #define SF_MAX_KVM_VCPUS_PER_VM 512
 
@@ -116,14 +91,11 @@ struct task_clone_entry {
 struct sf_kvm_vcpu_map {
 	unsigned int src_fd;
 	unsigned int vcpu_id;
-	struct file *new_file;
 	struct kvm_vcpu *new_vcpu;
 };
 
 struct sf_kvm_vm_map {
 	unsigned int src_fd;
-	struct file *src_vm_file;
-	struct file *new_vm_file;
 	struct kvm *src_kvm;
 	struct kvm *new_kvm;
 	struct sf_kvm_vcpu_map vcpus[SF_MAX_KVM_VCPUS_PER_VM];
@@ -137,7 +109,6 @@ struct tgid_clone_entry {
 	struct signal_struct *shared_signal;
 	struct sighand_struct *shared_sighand;
 	struct files_struct *shared_files;
-	struct fs_struct *shared_fs;
 	/* KVM fd replacement map is keyed per leader because files/mm are leader-shared. */
 	struct sf_kvm_vm_map kvm_vms[SF_MAX_KVM_VMS_PER_PROC];
 	int kvm_vm_count;
@@ -149,7 +120,6 @@ struct container_clone_ctx {
 
 	struct pid_namespace *new_pid_ns;
 	struct nsproxy *new_nsproxy;
-	bool isolate_netns;
 
 	struct task_clone_entry tasks[MAX_CLONE_TASKS];
 	int task_count;
@@ -166,7 +136,6 @@ struct task_struct *superfork_copy_process(
 	struct container_clone_ctx *ctx,
 	struct task_struct *src_task,
 	struct tgid_clone_entry *tgid_entry,
-	const char *new_rootfs_path,
 	const char *src_bundle_path,
 	const char *dst_bundle_path,
 	bool is_leader);
