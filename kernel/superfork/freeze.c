@@ -13,6 +13,7 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/superfork.h>
 #include <asm/ptrace.h>
 #include "internal.h"
@@ -328,6 +329,44 @@ static inline int thread_user_mode(struct task_struct *thread)
 	return 0;
 }
 
+static inline bool superfork_skip_vhost_user_worker(struct task_struct *thread)
+{
+	return !!(thread->flags & PF_USER_WORKER) &&
+	       !strncmp(thread->comm, "vhost-", TASK_COMM_LEN);
+}
+
+static inline bool superfork_skip_kvm_nx_user_worker(struct task_struct *thread)
+{
+	return !!(thread->flags & PF_USER_WORKER) &&
+	       !strncmp(thread->comm, "kvm-nx-lpage-", TASK_COMM_LEN);
+}
+
+/*
+ * Plain PF_KTHREAD tasks are still skipped here: they are not part of the
+ * user-visible descendant tree that the kata driver passes in, and cloning a
+ * detached kernel service task without its owning userspace context is not
+ * meaningful.
+ *
+ * We also skip PF_USER_WORKER helpers whose copied kernel stacks still carry
+ * live source-side control objects. That includes both vhost workers and KVM's
+ * NX hugepage recovery helper: they resume inside vhost_task_fn with source
+ * struct vhost_task state on-stack, and the NX helper also carries a source
+ * struct kvm * data argument. The destination VM can spawn its own recovery
+ * helper on first KVM_RUN via kvm_mmu_post_init_vm(), so cloning the source
+ * helper is both unnecessary and actively unsafe.
+ */
+static inline bool superfork_skip_thread(struct task_struct *thread)
+{
+	return !!(thread->flags & PF_KTHREAD) ||
+	       superfork_skip_vhost_user_worker(thread) ||
+	       superfork_skip_kvm_nx_user_worker(thread);
+}
+
+static inline bool superfork_helper_thread(struct task_struct *thread)
+{
+	return !!(thread->flags & (PF_KTHREAD | PF_USER_WORKER));
+}
+
 #define SUPERFORK_FREEZE_WAIT_RETRIES 2000
 #define SUPERFORK_FREEZE_WAIT_MS      5
 
@@ -337,12 +376,17 @@ static inline int thread_user_mode(struct task_struct *thread)
  * if the saved RIP is inside kernel code, superfork_copy_thread would set up
  * a clone that resumes mid-kernel-function with a stale stack.
  *
- * vhost_tasks (PF_USER_WORKER) satisfy user_mode() after the cgroup freezer
- * kicks them out of kvm_vcpu_block.  Plain PF_KTHREAD tasks are handled
- * separately in superfork_copy_kthread and bypass this check.
+ * Kernel-managed helper threads are excluded as clone candidates; see
+ * superfork_skip_thread().  We still require them to be frozen/stopped so
+ * source-side kernel state is quiescent before we duplicate KVM/files/mm.
  */
 static bool thread_ready_for_clone(struct task_struct *thread)
 {
+	if (superfork_helper_thread(thread))
+		return cgroup_task_frozen(thread) ||
+		       task_is_stopped(thread) ||
+		       task_is_traced(thread);
+
 	if (!cgroup_task_frozen(thread) &&
 	    !task_is_stopped(thread) &&
 	    !task_is_traced(thread))
@@ -386,6 +430,21 @@ static void log_source_freeze_wait_timeout(pid_t *kpids, size_t count)
 			frozenish = cgroup_task_frozen(thread) ||
 				    task_is_stopped(thread) ||
 				    task_is_traced(thread);
+			if (superfork_skip_thread(thread)) {
+				if (frozenish)
+					continue;
+
+				pr_warn("superfork: freeze-wait helper pid=%d tgid=%d state=0x%x frozen=%d stopped=%d traced=%d flags=0x%x\n",
+					thread->pid, thread->tgid,
+					READ_ONCE(thread->__state), thread->frozen,
+					task_is_stopped(thread), task_is_traced(thread),
+					thread->flags);
+				logged++;
+				if (logged >= max_logs)
+					break;
+				continue;
+			}
+
 			user = user_mode(task_pt_regs(thread));
 
 			if (frozenish && user)
@@ -485,7 +544,7 @@ int collect_frozen_tasks(struct container_clone_ctx *ctx,
 		for (i = 0; i < count; i++) {
 			if (process->tgid == kpids[i]) {
 				struct tgid_clone_entry *tgid_entry;
-				bool first_thread = true;
+				bool leader_seen = false;
 
 				tgid_entry = find_or_create_tgid_entry(ctx, process->tgid);
 
@@ -493,9 +552,16 @@ int collect_frozen_tasks(struct container_clone_ctx *ctx,
 					goto err_nomem;
 
 				for_each_thread(process, thread) {
-
 					if (ctx->task_count >= MAX_CLONE_TASKS)
 						goto err_nomem;
+
+					if (superfork_skip_thread(thread)) {
+						if (verify_thread_frozen(thread) < 0) {
+							ret = -EBUSY;
+							goto err_release;
+						}
+						continue;
+					}
 
 					if (verify_thread_frozen(thread) < 0 || thread_user_mode(thread) < 0) {
 						ret = -EBUSY;
@@ -504,12 +570,21 @@ int collect_frozen_tasks(struct container_clone_ctx *ctx,
 
 					ctx->tasks[ctx->task_count].old_task = thread;
 					ctx->tasks[ctx->task_count].old_tgid = process->tgid;
-					ctx->tasks[ctx->task_count].is_leader = first_thread;
+					ctx->tasks[ctx->task_count].is_leader =
+						(thread == process->group_leader);
 					ctx->tasks[ctx->task_count].new_task = NULL;
 					ctx->task_count++;
 
 					get_task_struct(thread);
-					first_thread = false;
+					if (thread == process->group_leader)
+						leader_seen = true;
+				}
+
+				if (!leader_seen) {
+					pr_err("superfork: missing clonable leader for tgid %d\n",
+					       process->tgid);
+					ret = -EINVAL;
+					goto err_release;
 				}
 				break;
 			}

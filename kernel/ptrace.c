@@ -297,6 +297,11 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 	/* Don't let security modules deny introspection */
 	if (same_thread_group(task, current))
 		return 0;
+
+	if (unlikely(READ_ONCE(task->exit_state) == EXIT_DEAD ||
+		     READ_ONCE(task->__state) == TASK_DEAD))
+		return -ESRCH;
+
 	rcu_read_lock();
 	if (mode & PTRACE_MODE_FSCREDS) {
 		caller_uid = cred->fsuid;
@@ -314,6 +319,10 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 		caller_gid = cred->gid;
 	}
 	tcred = __task_cred(task);
+	if (unlikely(!tcred)) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
 	if (uid_eq(caller_uid, tcred->euid) &&
 	    uid_eq(caller_uid, tcred->suid) &&
 	    uid_eq(caller_uid, tcred->uid)  &&

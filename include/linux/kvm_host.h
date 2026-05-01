@@ -2240,6 +2240,8 @@ int kvm_send_userspace_msi(struct kvm *kvm, struct kvm_msi *msi);
 
 void kvm_eventfd_init(struct kvm *kvm);
 int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args);
+typedef struct file *(*kvm_superfork_resolve_eventfd_file_t)(
+				void *opaque, struct eventfd_ctx *src_ctx);
 
 #ifdef CONFIG_HAVE_KVM_IRQCHIP
 int kvm_irqfd(struct kvm *kvm, struct kvm_irqfd *args);
@@ -2248,6 +2250,9 @@ bool kvm_notify_irqfd_resampler(struct kvm *kvm,
 				unsigned int irqchip,
 				unsigned int pin);
 void kvm_irq_routing_update(struct kvm *);
+int kvm_superfork_restore_vm_io(struct kvm *dst, struct kvm *src,
+				kvm_superfork_resolve_eventfd_file_t resolve,
+				void *opaque);
 #else
 static inline int kvm_irqfd(struct kvm *kvm, struct kvm_irqfd *args)
 {
@@ -2261,6 +2266,14 @@ static inline bool kvm_notify_irqfd_resampler(struct kvm *kvm,
 					      unsigned int pin)
 {
 	return false;
+}
+
+static inline int
+kvm_superfork_restore_vm_io(struct kvm *dst, struct kvm *src,
+			    kvm_superfork_resolve_eventfd_file_t resolve,
+			    void *opaque)
+{
+	return 0;
 }
 #endif /* CONFIG_HAVE_KVM_IRQCHIP */
 

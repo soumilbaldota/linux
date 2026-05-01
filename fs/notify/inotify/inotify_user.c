@@ -726,6 +726,32 @@ SYSCALL_DEFINE0(inotify_init)
 	return do_inotify_init(0);
 }
 
+/**
+ * inotify_file_create - allocate a new inotify file without installing an fd
+ * @flags: O_CLOEXEC and/or O_NONBLOCK
+ *
+ * Returns a struct file * with one reference held by the caller, or an
+ * ERR_PTR on failure.  Used by superfork to give each cloned task a fresh,
+ * empty inotify instance in place of the source's inotify fd.
+ */
+struct file *inotify_file_create(int flags)
+{
+	struct fsnotify_group *group;
+	struct file *file;
+
+	group = inotify_new_group(inotify_max_queued_events);
+	if (IS_ERR(group))
+		return ERR_CAST(group);
+
+	file = anon_inode_getfile("inotify", &inotify_fops, group,
+				  O_RDONLY | (flags & (O_CLOEXEC | O_NONBLOCK)));
+	if (IS_ERR(file))
+		fsnotify_destroy_group(group);
+
+	return file;
+}
+EXPORT_SYMBOL_GPL(inotify_file_create);
+
 SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
 		u32, mask)
 {

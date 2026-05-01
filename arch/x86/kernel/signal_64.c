@@ -161,6 +161,31 @@ static unsigned long frame_uc_flags(struct pt_regs *regs)
 	return flags;
 }
 
+static bool superfork_sigframe_debug_target(void)
+{
+	return !strcmp(current->comm, "containerd-shim") ||
+	       !strncmp(current->comm, "virtiofsd", 9) ||
+	       !strncmp(current->comm, "qemu-system-x86", 15) ||
+	       !strcmp(current->comm, "vring_worker");
+}
+
+static void superfork_log_x64_sigframe_failure(const char *reason,
+					       struct ksignal *ksig,
+					       struct pt_regs *regs,
+					       struct rt_sigframe __user *frame)
+{
+	if (!superfork_sigframe_debug_target())
+		return;
+
+	pr_info("superfork-sigframe: pid=%d comm=%s sig=%d reason=%s handler=%px sa_flags=0x%lx restorer=%px frame=%px user_ip=0x%lx user_sp=0x%lx sas_sp=0x%lx sas_size=0x%zx sas_flags=0x%x\n",
+		current->pid, current->comm, ksig->sig, reason,
+		ksig->ka.sa.sa_handler, ksig->ka.sa.sa_flags,
+		ksig->ka.sa.sa_restorer, frame,
+		regs->ip, regs->sp,
+		(unsigned long)current->sas_ss_sp, current->sas_ss_size,
+		sas_ss_flags(regs->sp));
+}
+
 int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 {
 	sigset_t *set = sigmask_to_save();
@@ -169,14 +194,20 @@ int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 	unsigned long uc_flags;
 
 	/* x86-64 should always use SA_RESTORER. */
-	if (!(ksig->ka.sa.sa_flags & SA_RESTORER))
+	if (!(ksig->ka.sa.sa_flags & SA_RESTORER)) {
+		superfork_log_x64_sigframe_failure("missing-sa-restorer",
+						   ksig, regs, NULL);
 		return -EFAULT;
+	}
 
 	frame = get_sigframe(ksig, regs, sizeof(struct rt_sigframe), &fp);
 	uc_flags = frame_uc_flags(regs);
 
-	if (!user_access_begin(frame, sizeof(*frame)))
+	if (!user_access_begin(frame, sizeof(*frame))) {
+		superfork_log_x64_sigframe_failure("user-access-begin",
+						   ksig, regs, frame);
 		return -EFAULT;
+	}
 
 	/* Create the ucontext.  */
 	unsafe_put_user(uc_flags, &frame->uc.uc_flags, Efault);
@@ -191,12 +222,18 @@ int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 	user_access_end();
 
 	if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
-		if (copy_siginfo_to_user(&frame->info, &ksig->info))
+		if (copy_siginfo_to_user(&frame->info, &ksig->info)) {
+			superfork_log_x64_sigframe_failure("copy-siginfo",
+							   ksig, regs, frame);
 			return -EFAULT;
+		}
 	}
 
-	if (setup_signal_shadow_stack(ksig))
+	if (setup_signal_shadow_stack(ksig)) {
+		superfork_log_x64_sigframe_failure("shadow-stack",
+						   ksig, regs, frame);
 		return -EFAULT;
+	}
 
 	/* Set up registers for signal handler */
 	regs->di = ksig->sig;
@@ -237,6 +274,8 @@ int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 
 Efault:
 	user_access_end();
+	superfork_log_x64_sigframe_failure("unsafe-put-user", ksig, regs,
+						 frame);
 	return -EFAULT;
 }
 

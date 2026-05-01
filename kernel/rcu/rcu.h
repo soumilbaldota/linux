@@ -258,10 +258,18 @@ static inline void debug_rcu_head_unqueue(struct rcu_head *head)
 }
 #endif	/* #else !CONFIG_DEBUG_OBJECTS_RCU_HEAD */
 
-static inline void debug_rcu_head_callback(struct rcu_head *rhp)
+/*
+ * Returns false and dumps slab info if func is NULL (corrupt/UAF rcu_head).
+ * Caller must skip invoking the callback in that case.
+ */
+static inline bool debug_rcu_head_callback(struct rcu_head *rhp)
 {
-	if (unlikely(!rhp->func))
+	if (unlikely(!rhp->func)) {
+		pr_err("RCU: NULL callback func in rcu_head %p — likely use-after-free\n", rhp);
 		kmem_dump_obj(rhp);
+		return false;
+	}
+	return true;
 }
 
 static inline bool rcu_barrier_cb_is_done(struct rcu_head *rhp)

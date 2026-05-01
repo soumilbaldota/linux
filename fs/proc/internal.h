@@ -144,9 +144,24 @@ static inline struct pid *proc_pid(const struct inode *inode)
 	return PROC_I(inode)->pid;
 }
 
+static inline bool proc_task_exited_dead(const struct task_struct *task)
+{
+	return task &&
+	       (READ_ONCE(task->exit_state) == EXIT_DEAD ||
+		READ_ONCE(task->__state) == TASK_DEAD);
+}
+
 static inline struct task_struct *get_proc_task(const struct inode *inode)
 {
-	return get_pid_task(proc_pid(inode), PIDTYPE_PID);
+	struct task_struct *task;
+
+	task = get_pid_task(proc_pid(inode), PIDTYPE_PID);
+	if (unlikely(proc_task_exited_dead(task))) {
+		put_task_struct(task);
+		return NULL;
+	}
+
+	return task;
 }
 
 void task_dump_owner(struct task_struct *task, umode_t mode,

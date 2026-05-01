@@ -3,6 +3,8 @@
 #include <linux/string.h>
 #include <linux/superfork.h>
 #include <asm/processor.h>
+#include <asm/syscall.h>
+#include <asm/unistd.h>
 #include <asm/frame.h>
 #include <asm/switch_to.h>
 #include <asm/fpu/api.h>
@@ -12,6 +14,57 @@
 #include <asm/shstk.h>
 #include <asm/mmu_context.h>
 #include <asm/io_bitmap.h>
+
+static inline unsigned long
+superfork_get_nr_restart_syscall(struct task_struct *p,
+				 const struct pt_regs *regs)
+{
+#ifdef CONFIG_IA32_EMULATION
+	if (p->restart_block.arch_data & TS_COMPAT)
+		return __NR_ia32_restart_syscall;
+#endif
+#ifdef CONFIG_X86_X32_ABI
+	return __NR_restart_syscall | (regs->orig_ax & __X32_SYSCALL_BIT);
+#else
+	return __NR_restart_syscall;
+#endif
+}
+
+/*
+ * copy_thread() zeroes ax so a normal fork child returns 0 from clone/fork.
+ * superfork is exact-state cloning instead: if the frozen source task was on
+ * the way out of an interrupted syscall, preserve that exit state and apply
+ * the same restart rewrite x86 signal exit would have used.
+ */
+static void superfork_rewrite_interrupted_syscall(struct task_struct *p,
+						  struct pt_regs *regs)
+{
+	long err;
+	int nr;
+
+	nr = syscall_get_nr(p, regs);
+	if (nr == -1)
+		return;
+
+	err = syscall_get_error(p, regs);
+	switch (err) {
+	case -ERESTARTNOHAND:
+	case -ERESTARTSYS:
+	case -ERESTARTNOINTR:
+		regs->ax = regs->orig_ax;
+		regs->ip -= 2;
+		pr_info_ratelimited("superfork: restart cloned syscall pid=%d comm=%s nr=%d err=%ld ip=0x%lx\n",
+				    p->pid, p->comm, nr, err, regs->ip);
+		break;
+
+	case -ERESTART_RESTARTBLOCK:
+		regs->ax = superfork_get_nr_restart_syscall(p, regs);
+		regs->ip -= 2;
+		pr_info_ratelimited("superfork: restartblock cloned syscall pid=%d comm=%s nr=%d err=%ld ip=0x%lx ax=0x%lx\n",
+				    p->pid, p->comm, nr, err, regs->ip, regs->ax);
+		break;
+	}
+}
 
 /*
  * Clone a running kernel thread or vhost_task user-worker.
@@ -311,14 +364,14 @@ int superfork_copy_thread(struct task_struct *p,
      * The snap already has ip rewound by 2 and ax restored to orig_ax,
      * so we just copy it in wholesale and do NOT zero ax.
      */
-    if (src_task->sf_vcpu_snap &&
-        READ_ONCE(src_task->sf_vcpu_snap->valid)) {
-        smp_rmb();
-        *childregs = src_task->sf_vcpu_snap->saved_regs;
-    } else {
-        *childregs    = *srcregs;
-        childregs->ax = 0;
-    }
+	    if (src_task->sf_vcpu_snap &&
+	        READ_ONCE(src_task->sf_vcpu_snap->valid)) {
+	        smp_rmb();
+	        *childregs = src_task->sf_vcpu_snap->saved_regs;
+	    } else {
+	        *childregs = *srcregs;
+	        superfork_rewrite_interrupted_syscall(p, childregs);
+	    }
 
     memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
 

@@ -2890,6 +2890,7 @@ void init_scx_entity(struct sched_ext_entity *scx)
 {
 	memset(scx, 0, sizeof(*scx));
 	INIT_LIST_HEAD(&scx->dsq_list.node);
+	INIT_LIST_HEAD(&scx->tasks_node);
 	RB_CLEAR_NODE(&scx->dsq_priq);
 	scx->sticky_cpu = -1;
 	scx->holding_cpu = -1;

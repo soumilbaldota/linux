@@ -19,11 +19,13 @@
 #include <linux/delayacct.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
+#include <linux/ftrace.h>
 #include <linux/fs_struct.h>
 #include <linux/fs.h>
 #include <linux/futex.h>
 #include <linux/namei.h>
 #include <linux/ipc_namespace.h>
+#include <linux/key.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/lockdep.h>
@@ -38,6 +40,7 @@
 #include <linux/preempt.h>
 #include <linux/psi.h>
 #include <linux/ptrace.h>
+#include <linux/rseq.h>
 #include <linux/sched.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/cputime.h>
@@ -53,30 +56,130 @@
 #include <linux/shm.h>
 #include <linux/slab.h>
 #include <linux/superfork.h>
+#include <linux/kstack_erase.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/thread_info.h>
 #include <linux/tick.h>
+#include <linux/tty.h>
 #include <linux/tsacct_kern.h>
 #include <linux/uaccess.h>
 #include <linux/unwind_deferred.h>
 #include <linux/user_namespace.h>
 #include <linux/vmalloc.h>
+#include <trace/syscall.h>
 #include "../futex/futex.h"
 #include "internal.h"
 
 /* ---- credentials ------------------------------------------------------- */
 
+static inline void superfork_mm_clear_owner(struct mm_struct *mm,
+					    struct task_struct *p)
+{
+#ifdef CONFIG_MEMCG
+	if (mm && mm->owner == p)
+		WRITE_ONCE(mm->owner, NULL);
+#endif
+}
+
+static bool superfork_can_share_cred(struct task_struct *src_task,
+				     u64 clone_flags)
+{
+#ifdef CONFIG_KEYS
+	const struct cred *src_cred;
+	bool share;
+
+	if (!(clone_flags & CLONE_THREAD))
+		return false;
+
+	src_cred = get_task_cred(src_task);
+	share = !src_cred->thread_keyring;
+	put_cred(src_cred);
+	return share;
+#else
+	return clone_flags & CLONE_THREAD;
+#endif
+}
+
+static struct cred *superfork_prepare_task_cred(struct task_struct *src_task,
+						u64 clone_flags)
+{
+	struct cred *new;
+
+	new = prepare_kernel_cred(src_task);
+	if (!new)
+		return NULL;
+
+#ifdef CONFIG_KEYS
+	{
+		const struct cred *old = get_task_cred(src_task);
+
+		new->session_keyring = key_get(old->session_keyring);
+		new->process_keyring = key_get(old->process_keyring);
+		new->thread_keyring = key_get(old->thread_keyring);
+		new->request_key_auth = key_get(old->request_key_auth);
+		new->jit_keyring = old->jit_keyring;
+
+		if (new->thread_keyring) {
+			key_put(new->thread_keyring);
+			new->thread_keyring = NULL;
+			if (clone_flags & CLONE_THREAD) {
+				if (install_thread_keyring_to_cred(new)) {
+					put_cred(old);
+					put_cred(new);
+					return NULL;
+				}
+			}
+		}
+
+		if (!(clone_flags & CLONE_THREAD)) {
+			key_put(new->process_keyring);
+			new->process_keyring = NULL;
+		}
+
+		put_cred(old);
+	}
+#endif
+
+	return new;
+}
+
 static int superfork_copy_creds(struct task_struct *p,
 				struct task_struct *src_task,
+				struct tgid_clone_entry *tgid_entry,
 				u64 clone_flags)
 {
-	const struct cred *src_cred;
+	struct cred *new;
 
-	rcu_read_lock();
-	src_cred = __task_cred(src_task);
-	p->real_cred = get_cred(src_cred);
-	p->cred = get_cred(src_cred);
-	rcu_read_unlock();
+#ifdef CONFIG_KEYS_REQUEST_CACHE
+	p->cached_requested_key = NULL;
+#endif
+
+	/*
+	 * Threads in the cloned thread group must share the cloned leader's
+	 * cred object, not the source task's, or the clone can end up tearing
+	 * down source-owned cred state as threads exit.
+	 */
+	if (superfork_can_share_cred(src_task, clone_flags)) {
+		if (!tgid_entry || !tgid_entry->new_leader ||
+		    !tgid_entry->new_leader->cred)
+			return -EINVAL;
+
+		p->cred = tgid_entry->new_leader->cred;
+		p->real_cred = get_cred_many(p->cred, 2);
+		inc_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
+		return 0;
+	}
+
+	/*
+	 * Leaders and thread-keyring users need a distinct cred object that
+	 * mirrors a fork of the frozen source task rather than a kernel-service
+	 * override cred.
+	 */
+	new = superfork_prepare_task_cred(src_task, clone_flags);
+	if (!new)
+		return -ENOMEM;
+
+	p->cred = p->real_cred = get_cred(new);
 
 	inc_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
 	return 0;
@@ -91,13 +194,15 @@ static int superfork_copy_creds(struct task_struct *p,
  * NOT the original task's files - this is critical for isolation.
  */
 static int superfork_copy_files(struct task_struct *p,
-				struct task_struct *src_task,
+				struct container_clone_ctx *ctx,
+				struct task_clone_entry *task_entry,
 				struct tgid_clone_entry *tgid_entry,
-				const char *src_bundle_path,
-				const char *dst_bundle_path,
+				const struct container_config *config,
 				u64 clone_flags)
 {
+	struct task_struct *src_task = task_entry->old_task;
 	struct files_struct *oldf = src_task->files;
+	struct sf_ns_domain *domain;
 
 	if (!oldf) {
 		p->files = NULL;
@@ -117,9 +222,14 @@ static int superfork_copy_files(struct task_struct *p,
 		return 0;
 	}
 
+	domain = get_ctx_domain(ctx, task_entry->domain_id);
+	if (!domain || !domain->new_nsproxy)
+		return -EINVAL;
+
 	/* Leader: duplicate and store for threads to share */
-	p->files = superfork_dup_files_for_container(oldf, src_bundle_path,
-						     dst_bundle_path,
+	p->files = superfork_dup_files_for_container(ctx, oldf, config,
+						     domain,
+						     p,
 						     p->mm, tgid_entry);
 	if (IS_ERR(p->files))
 		return PTR_ERR(p->files);
@@ -130,46 +240,122 @@ static int superfork_copy_files(struct task_struct *p,
 
 /* ---- filesystem root --------------------------------------------------- */
 
+static u64 superfork_thread_clone_flags(struct task_struct *src_task)
+{
+	struct task_struct *leader = src_task->group_leader;
+	u64 flags = CLONE_THREAD | CLONE_VM | CLONE_FILES | CLONE_SIGHAND;
+
+	/*
+	 * Preserve source thread-group FS sharing when it exists. The clone's
+	 * shared fs_struct is created from the source leader and reused by
+	 * siblings that pointed at the same source fs.
+	 */
+	if (src_task->fs && leader && src_task->fs == leader->fs)
+		flags |= CLONE_FS;
+
+	return flags;
+}
+
+static int superfork_resolve_task_fs_path(const struct sf_ns_domain *domain,
+					  const char *src_path,
+					  struct path *path)
+{
+	int ret;
+
+	ret = superfork_domain_lookup_path(domain, src_path,
+					   LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
+					   path);
+	if (!ret)
+		return 0;
+
+	if (src_path && src_path[0]) {
+		ret = kern_path(src_path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, path);
+		if (!ret)
+			return 0;
+	}
+
+	if (!src_path || !src_path[0] || !strcmp(src_path, "/"))
+		return superfork_domain_lookup_path(domain, "/",
+						    LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
+						    path);
+
+	return ret;
+}
+
 static int superfork_copy_fs(struct task_struct *p,
-			     struct task_struct *src_task,
-			     const char *dst_bundle_path)
+			     struct container_clone_ctx *ctx,
+			     struct task_clone_entry *task_entry,
+			     struct tgid_clone_entry *tgid_entry,
+			     const struct container_config *config,
+			     u64 clone_flags)
 {
 	struct fs_struct *fs;
-	struct path new_root, old_root, old_pwd;
+	struct task_struct *src_task = task_entry->old_task;
+	struct sf_ns_domain *domain = get_ctx_domain(ctx, task_entry->domain_id);
+	struct path new_root;
+	struct path new_pwd;
 	int ret;
+
+	(void)config;
+
+	if (!src_task->fs) {
+		p->fs = NULL;
+		return 0;
+	}
+
+	if (clone_flags & CLONE_FS) {
+		if (!tgid_entry->shared_fs)
+			return -EINVAL;
+
+		read_seqlock_excl(&tgid_entry->shared_fs->seq);
+		if (tgid_entry->shared_fs->in_exec) {
+			read_sequnlock_excl(&tgid_entry->shared_fs->seq);
+			return -EAGAIN;
+		}
+		tgid_entry->shared_fs->users++;
+		read_sequnlock_excl(&tgid_entry->shared_fs->seq);
+		p->fs = tgid_entry->shared_fs;
+		return 0;
+	}
+
+	if (!domain || !domain->new_nsproxy)
+		return -EINVAL;
 
 	fs = copy_fs_struct(src_task->fs);
 	if (!fs)
 		return -ENOMEM;
 
-	if (dst_bundle_path && dst_bundle_path[0] != '\0') {
-		ret = kern_path(dst_bundle_path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
-				&new_root);
-		if (ret) {
-			pr_err("superfork: failed to resolve cloned rootfs path %s: %d\n",
-			       dst_bundle_path, ret);
-			free_fs_struct(fs);
-			return ret;
-		}
-
-		write_seqlock(&fs->seq);
-		/* Save old paths before overwriting */
-		old_root = fs->root;
-		old_pwd = fs->pwd;
-
-		/* Update to new rootfs */
-		fs->root = new_root;
-		fs->pwd = new_root;
-		path_get(&fs->root);
-		path_get(&fs->pwd);
-		write_sequnlock(&fs->seq);
-
-		/* Release old paths */
-		path_put(&old_root);
-		path_put(&old_pwd);
+	ret = superfork_resolve_task_fs_path(domain, task_entry->src_root_path,
+					     &new_root);
+	if (ret) {
+		pr_err("superfork: failed to resolve cloned root for pid %d path '%s': %d\n",
+		       src_task->pid, task_entry->src_root_path, ret);
+		free_fs_struct(fs);
+		return ret;
 	}
 
+	ret = superfork_resolve_task_fs_path(domain, task_entry->src_pwd_path,
+					     &new_pwd);
+	if (ret) {
+		/*
+		 * pwd is unreachable in the clone's namespace — common for
+		 * processes like virtiofsd that empty their private mount
+		 * namespace after establishing their cwd.  Fall back to the
+		 * clone's root so the task starts in a valid directory.
+		 */
+		pr_debug("superfork: pid %d: pwd '%s' unreachable in clone ns (%d), using clone root\n",
+			 src_task->pid, task_entry->src_pwd_path, ret);
+		path_get(&new_root);
+		new_pwd = new_root;
+	}
+
+	set_fs_root(fs, &new_root);
+	set_fs_pwd(fs, &new_pwd);
+	path_put(&new_root);
+	path_put(&new_pwd);
+
 	p->fs = fs;
+	tgid_entry->shared_fs = fs;
 	return 0;
 }
 
@@ -223,6 +409,7 @@ static int superfork_copy_signal(struct task_struct *p,
 				 u64 clone_flags)
 {
 	struct signal_struct *sig;
+	u64 cpu_limit;
 
 	if (clone_flags & CLONE_THREAD) {
 		/* Thread: share the CLONED leader's signal struct */
@@ -268,8 +455,19 @@ static int superfork_copy_signal(struct task_struct *p,
 	memcpy(sig->rlim, src_task->signal->rlim, sizeof(sig->rlim));
 	task_unlock(src_task->group_leader);
 
-	/* Initialize autogroup (required to avoid NULL deref in sched_autogroup_exit) */
-	sched_autogroup_fork(sig);
+	cpu_limit = READ_ONCE(sig->rlim[RLIMIT_CPU].rlim_cur);
+	posix_cputimers_init(&sig->posix_cputimers);
+	if (cpu_limit != RLIM_INFINITY) {
+		sig->posix_cputimers.bases[CPUCLOCK_PROF].nextevt =
+			cpu_limit * NSEC_PER_SEC;
+		sig->posix_cputimers.timers_active = true;
+	}
+	sig->audit_tty = READ_ONCE(src_task->signal->audit_tty);
+	/*
+	 * Upstream fork keys these helpers off current. In superfork the source
+	 * task is frozen elsewhere, so clone from that task explicitly.
+	 */
+	sched_autogroup_fork_from_task(sig, src_task);
 
 #ifdef CONFIG_CGROUPS
 	init_rwsem(&sig->cgroup_threadgroup_rwsem);
@@ -472,6 +670,30 @@ static void superfork_copy_seccomp(struct task_struct *p,
 #endif
 }
 
+static void superfork_copy_rseq(struct task_struct *p,
+				const struct task_struct *src_task)
+{
+#ifdef CONFIG_RSEQ
+	/*
+	 * rseq_fork() copies registration state from current, which is correct
+	 * for fork()/clone() but wrong for superfork: the caller is the helper
+	 * task, not the frozen source task we are reproducing.
+	 *
+	 * Preserve the exact source task registration instead. The cloned
+	 * userspace image has a duplicate/shared mm matching the source task,
+	 * so the source task's rseq TLS pointer remains the only sensible
+	 * registration to carry forward.
+	 */
+	p->rseq = src_task->rseq;
+	p->rseq_len = src_task->rseq_len;
+	p->rseq_sig = src_task->rseq_sig;
+	p->rseq_event_mask = src_task->rseq_event_mask;
+
+	if (p->rseq)
+		rseq_set_notify_resume(p);
+#endif
+}
+
 /* ---- copy_process ------------------------------------------------------ */
 
 /*
@@ -483,13 +705,14 @@ static void superfork_copy_seccomp(struct task_struct *p,
  */
 struct task_struct *superfork_copy_process(
 	struct container_clone_ctx *ctx,
-	struct task_struct *src_task,
+	struct task_clone_entry *task_entry,
 	struct tgid_clone_entry *tgid_entry,
-	const char *src_bundle_path,
-	const char *dst_bundle_path,
+	const struct container_config *config,
 	bool is_leader)
 {
 	int retval;
+	struct task_struct *src_task = task_entry->old_task;
+	struct sf_ns_domain *domain = get_ctx_domain(ctx, task_entry->domain_id);
 	struct task_struct *p;
 	struct pid *pid;
 	u64 clone_flags = 0;
@@ -503,8 +726,7 @@ struct task_struct *superfork_copy_process(
 	 * so non-leader calls can reference them.
 	 */
 	if (!is_leader)
-		clone_flags = CLONE_THREAD | CLONE_VM |
-			      CLONE_FILES | CLONE_SIGHAND;
+		clone_flags = superfork_thread_clone_flags(src_task);
 
 	pr_debug("superfork: copy_process src_pid=%d is_leader=%d\n",
 		 src_task->pid, is_leader);
@@ -517,11 +739,37 @@ struct task_struct *superfork_copy_process(
 		return ERR_PTR(-ENOMEM);
 
 	/*
+	 * dup_task_struct() shallow-copies per-task tracing metadata.
+	 * Start the clone with clean fork bookkeeping instead of aliases of
+	 * the source task's function-graph shadow stack.
+	 */
+	ftrace_graph_init_task(p);
+
+	/*
 	 * The sf_vcpu_snap pointer is owned by the source task (allocated by
 	 * superfork_alloc_vcpu_snaps and read in superfork_copy_thread). The
 	 * clone must not share it; dup_task_struct shallow-copies the field.
 	 */
 	p->sf_vcpu_snap = NULL;
+
+	/*
+	 * dup_task_struct() also shallow-copies per-task tracing / observability
+	 * state that is owned by the source task or source mm.  Resuming an
+	 * exact userspace image does not safely recreate those kernel-side
+	 * objects, and leaving the copied pointers in place lets the clone race
+	 * against source-owned timers, task_work, and monitor state.
+	 *
+	 * Upstream fork either rebuilds or reinitializes these later via
+	 * uprobe_copy_process(), user_events_fork(), and rv_task_fork().  For
+	 * superfork, start clean until there is a source-task-aware replay path.
+	 */
+	p->utask = NULL;
+#ifdef CONFIG_USER_EVENTS
+	p->user_event_mm = NULL;
+#endif
+#ifdef CONFIG_RV
+	memset(&p->rv, 0, sizeof(p->rv));
+#endif
 
 	/*
 	 * Do NOT clear PF_KTHREAD / PF_USER_WORKER here: those task classes
@@ -593,7 +841,7 @@ struct task_struct *superfork_copy_process(
 	/*
 	 * Step 3: Copy credentials
 	 */
-	retval = superfork_copy_creds(p, src_task, clone_flags);
+	retval = superfork_copy_creds(p, src_task, tgid_entry, clone_flags);
 	if (retval) {
 		fail_stage = "copy_creds";
 		goto bad_fork_free;
@@ -741,15 +989,16 @@ struct task_struct *superfork_copy_process(
 		goto bad_fork_cleanup_semundo;
 	}
 
-	retval = superfork_copy_files(p, src_task, tgid_entry,
-				     src_bundle_path, dst_bundle_path,
+	retval = superfork_copy_files(p, ctx, task_entry, tgid_entry,
+				     config,
 				     clone_flags);
 	if (retval) {
 		fail_stage = "copy_files";
 		goto bad_fork_cleanup_mm_only;
 	}
 
-	retval = superfork_copy_fs(p, src_task, dst_bundle_path);
+	retval = superfork_copy_fs(p, ctx, task_entry, tgid_entry,
+				   config, clone_flags);
 	if (retval) {
 		fail_stage = "copy_fs";
 		goto bad_fork_cleanup_files_mm;
@@ -782,8 +1031,9 @@ struct task_struct *superfork_copy_process(
 	/*
 	 * Step 7: Set up namespaces
 	 */
-	if (!ctx->new_nsproxy) {
-		pr_err("superfork: nsproxy not initialized\n");
+	if (!domain || !domain->new_nsproxy) {
+		pr_err("superfork: namespace domain %u not initialized for pid %d\n",
+		       task_entry->domain_id, src_task->pid);
 		retval = -EINVAL;
 		fail_stage = "nsproxy_not_initialized";
 		goto bad_fork_cleanup_mm;
@@ -802,8 +1052,8 @@ struct task_struct *superfork_copy_process(
 	 * doesn't carry an owned ref for this new task.
 	 */
 	task_lock(p);
-	get_nsproxy(ctx->new_nsproxy);
-	p->nsproxy = ctx->new_nsproxy;
+	get_nsproxy(domain->new_nsproxy);
+	p->nsproxy = domain->new_nsproxy;
 	task_unlock(p);
 
 	/*
@@ -862,8 +1112,18 @@ struct task_struct *superfork_copy_process(
 	p->pdeath_signal = 0;
 	p->task_works = NULL;
 	clear_posix_cputimers_work(p);
+#ifdef CONFIG_BLOCK
+	p->plug = NULL;
+#endif
+#ifdef CONFIG_KRETPROBES
+	p->kretprobe_instances.first = NULL;
+#endif
+#ifdef CONFIG_RETHOOK
+	p->rethooks.first = NULL;
+#endif
 
 	futex_init_task(p);
+	superfork_copy_rseq(p, src_task);
 
 	user_disable_single_step(p);
 	clear_task_syscall_work(p, SYSCALL_TRACE);
@@ -874,6 +1134,7 @@ struct task_struct *superfork_copy_process(
 
 	/* Copy seccomp state */
 	superfork_copy_seccomp(p, src_task);
+	syscall_tracepoint_update(p);
 
 	/*
 	 * Step 11: Initialize scheduler/task state
@@ -896,12 +1157,18 @@ struct task_struct *superfork_copy_process(
 	INIT_LIST_HEAD(&p->ptrace_entry);
 	INIT_LIST_HEAD(&p->ptraced);
 
-	/* Reference counts */
-	refcount_set(&p->rcu_users, 2);
-	refcount_set(&p->usage, 1);
+	/*
+	 * dup_task_struct() already reset the new task's lifetime refcounts.
+	 * Do not overwrite them here: earlier clone steps such as copy_files()
+	 * may have installed kernel objects (for example io_uring io_wq state)
+	 * that legally took get_task_struct() references on @p.
+	 */
 
 	p->start_time = ktime_get_ns();
 	p->start_boottime = ktime_get_boottime_ns();
+
+	sched_core_fork(p);
+	stackleak_task_init(p);
 
 	pr_debug("superfork: copy_process done, new_pid=%d\n", p->pid);
 
@@ -920,14 +1187,17 @@ bad_fork_cleanup_files_mm:
 	exit_files(p);
 bad_fork_cleanup_mm_only:
 	if (p->mm) {
+		superfork_mm_clear_owner(p->mm, p);
 		mmput(p->mm);
 		p->mm = NULL;
 		p->active_mm = NULL;
 	}
 	goto bad_fork_cleanup_semundo;
 bad_fork_cleanup_mm:
-	if (p->mm)
+	if (p->mm) {
+		superfork_mm_clear_owner(p->mm, p);
 		mmput(p->mm);
+	}
 	goto bad_fork_cleanup_semundo;
 bad_fork_cleanup_semundo:
 	exit_sem(p);
@@ -952,6 +1222,7 @@ bad_fork_free:
 	dec_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
 	WRITE_ONCE(p->__state, TASK_DEAD);
 	exit_creds(p);
+	ftrace_graph_exit_task(p);
 	superfork_free_task_struct(p);
 	return ERR_PTR(retval);
 }

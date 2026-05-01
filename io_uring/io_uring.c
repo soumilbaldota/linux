@@ -64,6 +64,7 @@
 #include <linux/nospec.h>
 #include <linux/fsnotify.h>
 #include <linux/fadvise.h>
+#include <linux/fdtable.h>
 #include <linux/task_work.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/cmd.h>
@@ -272,11 +273,20 @@ static __cold void io_fallback_req_func(struct work_struct *work)
 	struct llist_node *node = llist_del_all(&ctx->fallback_llist);
 	struct io_kiocb *req, *tmp;
 	struct io_tw_state ts = {};
+	int n = 0;
 
 	percpu_ref_get(&ctx->refs);
 	mutex_lock(&ctx->uring_lock);
-	llist_for_each_entry_safe(req, tmp, node, io_task_work.node)
+	llist_for_each_entry_safe(req, tmp, node, io_task_work.node) {
+		struct task_struct *t = req->tctx ? req->tctx->task : NULL;
+		pr_info("io_uring: fallback ctx=%p req=%p opcode=%d tctx=%p task=%p pid=%d usage=%d\n",
+			ctx, req, req->opcode, req->tctx, t,
+			t ? t->pid : -1,
+			t ? refcount_read(&t->usage) : -1);
 		req->io_task_work.func(req, ts);
+		n++;
+	}
+	pr_info("io_uring: fallback done ctx=%p processed=%d\n", ctx, n);
 	io_submit_flush_completions(ctx);
 	mutex_unlock(&ctx->uring_lock);
 	percpu_ref_put(&ctx->refs);
@@ -682,6 +692,13 @@ static void io_cqring_do_overflow_flush(struct io_ring_ctx *ctx)
 	mutex_unlock(&ctx->uring_lock);
 }
 
+static inline bool io_superfork_trace_task(const struct task_struct *task)
+{
+	return task &&
+	       (!strcmp(task->comm, "qemu-system-x86") ||
+		!strncmp(task->comm, "virtiofsd", 9));
+}
+
 /* must to be called somewhat shortly after putting a request */
 static inline void io_put_task(struct io_kiocb *req)
 {
@@ -690,6 +707,14 @@ static inline void io_put_task(struct io_kiocb *req)
 	if (likely(tctx->task == current)) {
 		tctx->cached_refs++;
 	} else {
+		int usage = refcount_read(&tctx->task->usage);
+		if (unlikely(io_superfork_trace_task(tctx->task) && usage <= 2))
+			pr_warn("io_uring: io_put_task remote current=%s/%d target=%s/%d usage=%d rcu_users=%d inflight=%lld cached_refs=%d req_opcode=%d req_ctx=%p\n",
+				current->comm, current->pid,
+				tctx->task->comm, tctx->task->pid, usage,
+				refcount_read(&tctx->task->rcu_users),
+				percpu_counter_sum(&tctx->inflight),
+				tctx->cached_refs, req->opcode, req->ctx);
 		percpu_counter_sub(&tctx->inflight, 1);
 		if (unlikely(atomic_read(&tctx->in_cancel)))
 			wake_up(&tctx->wait);
@@ -700,6 +725,12 @@ static inline void io_put_task(struct io_kiocb *req)
 void io_task_refs_refill(struct io_uring_task *tctx)
 {
 	unsigned int refill = -tctx->cached_refs + IO_TCTX_REFS_CACHE_NR;
+	int usage_before = refcount_read(&current->usage);
+
+	if (unlikely(io_superfork_trace_task(current) && usage_before <= 2))
+		pr_info("io_uring: refill current=%s/%d usage_before=%d refill=%u inflight_before=%lld cached_before=%d\n",
+			current->comm, current->pid, usage_before, refill,
+			percpu_counter_sum(&tctx->inflight), tctx->cached_refs);
 
 	percpu_counter_add(&tctx->inflight, refill);
 	refcount_add(refill, &current->usage);
@@ -3065,8 +3096,15 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		/* don't spin on a single task if cancellation failed */
 		list_rotate_left(&ctx->tctx_list);
 		ret = task_work_add(node->task, &exit.task_work, TWA_SIGNAL);
-		if (WARN_ON_ONCE(ret))
+		if (WARN_ON_ONCE(ret)) {
+			/*
+			 * Task is dead/exiting — it will never run the task_work
+			 * callback and signal exit.completion, so the loop would
+			 * spin forever.  Force-remove the node so we can proceed.
+			 */
+			list_del_init(&node->ctx_node);
 			continue;
+		}
 
 		mutex_unlock(&ctx->uring_lock);
 		/*
@@ -3915,6 +3953,284 @@ err_fput:
 	fput(file);
 	return ret;
 }
+
+/**
+ * io_uring_file_create - allocate a new io_uring file matching a source ring
+ * @src: existing io_ring_ctx to clone parameters from
+ *
+ * Creates a fresh, empty io_uring ring with the same sq_entries, cq_entries
+ * and flags as @src, then returns the file without installing an fd.
+ * The source ring must have no in-flight SQEs (i.e. the owning task must be
+ * frozen) so the clone starts with a clean ring.
+ *
+ * Used by superfork to replace io_uring fds in cloned tasks.
+ */
+struct file *io_uring_file_create(struct io_ring_ctx *src,
+				  struct task_struct *task)
+{
+	struct io_uring_params p = {};
+	struct io_ring_ctx *ctx;
+	struct file *file;
+	int ret;
+
+	/*
+	 * Mirror the source ring's geometry. Strip flags that are only
+	 * meaningful to the original context or require setup we don't
+	 * reproduce for a fresh clone ring.
+	 */
+	p.sq_entries = src->sq_entries;
+	p.cq_entries = src->cq_entries;
+	p.flags = src->flags & ~(IORING_SETUP_SQPOLL |
+				 IORING_SETUP_REGISTERED_FD_ONLY |
+				 IORING_SETUP_NO_MMAP |
+				 IORING_SETUP_SINGLE_ISSUER |
+				 IORING_SETUP_DEFER_TASKRUN |
+				 IORING_SETUP_ATTACH_WQ |
+				 IORING_SETUP_R_DISABLED);
+	if ((p.flags & IORING_SETUP_TASKRUN_FLAG) &&
+	    !(p.flags & IORING_SETUP_COOP_TASKRUN))
+		p.flags &= ~IORING_SETUP_TASKRUN_FLAG;
+
+	ret = io_uring_sanitise_params(&p);
+	if (ret)
+		return ERR_PTR(ret);
+
+	ret = io_uring_fill_params(p.sq_entries, &p);
+	if (ret)
+		return ERR_PTR(ret);
+
+	ctx = io_ring_ctx_alloc(&p);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	ctx->clockid = CLOCK_MONOTONIC;
+	ctx->clock_offset = 0;
+
+	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
+		static_branch_inc(&io_key_has_sqarray);
+
+	if (ctx->flags & IORING_SETUP_IOPOLL) {
+		ctx->syscall_iopoll = 1;
+		ctx->lockless_cq = true;
+	}
+
+	/*
+	 * Match io_uring_create(): rings that don't use task_work completion
+	 * must not attempt lazy poll_wq activation later, or io_uring_poll()
+	 * will warn when a cloned task first polls the fresh ring.
+	 */
+	if (!ctx->task_complete)
+		ctx->poll_activated = true;
+
+	if (ctx->flags & IORING_SETUP_COOP_TASKRUN)
+		ctx->notify_method = TWA_SIGNAL_NO_IPI;
+	else
+		ctx->notify_method = TWA_SIGNAL;
+
+	ret = io_allocate_scq_urings(ctx, &p);
+	if (ret) {
+		io_ring_ctx_wait_and_kill(ctx);
+		return ERR_PTR(ret);
+	}
+
+	file = io_uring_get_file(ctx);
+	if (IS_ERR(file)) {
+		io_ring_ctx_wait_and_kill(ctx);
+		return file;
+	}
+
+	ret = io_uring_add_task_tctx_node(task, ctx);
+	if (ret) {
+		fput(file);
+		return ERR_PTR(ret);
+	}
+
+	return file;
+}
+EXPORT_SYMBOL_GPL(io_uring_file_create);
+
+static struct file *io_uring_replay_get_file_at(struct files_struct *files,
+						unsigned int fd)
+{
+	struct fdtable *fdt;
+	struct file *file = NULL;
+
+	spin_lock(&files->file_lock);
+	fdt = files_fdtable(files);
+	if (fd < fdt->max_fds && test_bit(fd, fdt->open_fds)) {
+		file = rcu_dereference_raw(fdt->fd[fd]);
+		if (file)
+			get_file(file);
+	}
+	spin_unlock(&files->file_lock);
+	return file;
+}
+
+static unsigned int io_uring_poll_req_count(struct io_ring_ctx *ctx)
+{
+	unsigned int i;
+	unsigned int count = 0;
+
+	for (i = 0; i < (1U << ctx->cancel_table.hash_bits); i++) {
+		struct io_hash_bucket *hb = &ctx->cancel_table.hbs[i];
+		struct io_kiocb *req;
+
+		hlist_for_each_entry(req, &hb->list, hash_node) {
+			if (req->opcode == IORING_OP_POLL_ADD)
+				count++;
+		}
+	}
+
+	return count;
+}
+
+static void io_uring_replay_cleanup_req(struct io_kiocb *req)
+{
+	if (unlikely(req->flags & IO_REQ_CLEAN_FLAGS))
+		io_clean_op(req);
+	io_put_file(req);
+	io_req_put_rsrc_nodes(req);
+	io_put_task(req);
+	io_req_add_to_cache(req, req->ctx);
+}
+
+static void io_uring_replay_get_task_ref(struct io_uring_task *tctx)
+{
+	pr_info("io_uring: replay_get_task_ref task=%p pid=%d usage_before=%d inflight=%lld cached_refs=%d\n",
+		tctx->task, tctx->task->pid,
+		refcount_read(&tctx->task->usage),
+		percpu_counter_sum(&tctx->inflight),
+		tctx->cached_refs);
+	percpu_counter_add(&tctx->inflight, 1);
+	get_task_struct(tctx->task);
+}
+
+static int io_uring_build_poll_replay_sqe(const struct io_kiocb *src_req,
+					  struct io_uring_sqe *sqe)
+{
+	const struct io_poll *poll;
+	u32 len = 0;
+	u32 events;
+
+	if (src_req->opcode != IORING_OP_POLL_ADD)
+		return -EOPNOTSUPP;
+	if (src_req->flags & REQ_F_FIXED_FILE)
+		return -EOPNOTSUPP;
+
+	poll = io_kiocb_to_cmd(src_req, struct io_poll);
+	if (!(poll->events & EPOLLET))
+		return -EOPNOTSUPP;
+	if (!(poll->events & EPOLLONESHOT))
+		len |= IORING_POLL_ADD_MULTI;
+
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = IORING_OP_POLL_ADD;
+	sqe->fd = src_req->cqe.fd;
+	sqe->len = len;
+	sqe->user_data = src_req->cqe.user_data;
+	events = mangle_poll(poll->events & 0xffff);
+	events |= poll->events & EPOLLEXCLUSIVE;
+	WRITE_ONCE(sqe->poll32_events, events);
+	return 0;
+}
+
+static int io_uring_replay_one_poll(struct io_ring_ctx *dst_ctx,
+				    struct files_struct *files,
+				    const struct io_kiocb *src_req,
+				    struct task_struct *task)
+{
+	struct io_uring_sqe sqe;
+	struct io_uring_task *tctx;
+	struct io_kiocb *req;
+	int ret;
+
+	if (!task || !task->io_uring)
+		return -EINVAL;
+
+	tctx = task->io_uring;
+
+	ret = io_uring_build_poll_replay_sqe(src_req, &sqe);
+	if (ret < 0)
+		return ret;
+
+	io_submit_state_start(&dst_ctx->submit_state, 1);
+	if (unlikely(!io_alloc_req(dst_ctx, &req))) {
+		io_submit_state_end(dst_ctx);
+		return -ENOMEM;
+	}
+
+	ret = io_init_req(dst_ctx, req, &sqe);
+	if (unlikely(ret)) {
+		io_req_add_to_cache(req, dst_ctx);
+		io_submit_state_end(dst_ctx);
+		return ret;
+	}
+
+	req->tctx = tctx;
+	io_uring_replay_get_task_ref(tctx);
+
+	req->file = io_uring_replay_get_file_at(files, sqe.fd);
+	if (!req->file) {
+		io_uring_replay_cleanup_req(req);
+		io_submit_state_end(dst_ctx);
+		return -EBADF;
+	}
+
+	ret = io_issue_sqe(req, IO_URING_F_NONBLOCK |
+				 IO_URING_F_COMPLETE_DEFER |
+				 IO_URING_F_INLINE);
+	if (ret)
+		io_uring_replay_cleanup_req(req);
+
+	io_submit_state_end(dst_ctx);
+	return ret;
+}
+
+int io_uring_file_replay(struct file *dst_file, struct file *src_file,
+			 struct files_struct *files,
+			 struct task_struct *task)
+{
+	struct io_ring_ctx *src_ctx;
+	struct io_ring_ctx *dst_ctx;
+	unsigned int i;
+	int ret = 0;
+
+	if (!dst_file || !src_file || !files)
+		return -EINVAL;
+	if (!io_is_uring_fops(dst_file) || !io_is_uring_fops(src_file))
+		return -EINVAL;
+
+	src_ctx = src_file->private_data;
+	dst_ctx = dst_file->private_data;
+
+	mutex_lock(&src_ctx->uring_lock);
+	if (dst_ctx != src_ctx)
+		mutex_lock(&dst_ctx->uring_lock);
+
+	for (i = 0; i < (1U << src_ctx->cancel_table.hash_bits); i++) {
+		struct io_hash_bucket *hb = &src_ctx->cancel_table.hbs[i];
+		struct io_kiocb *req;
+
+		hlist_for_each_entry(req, &hb->list, hash_node) {
+			if (req->opcode != IORING_OP_POLL_ADD)
+				continue;
+
+			ret = io_uring_replay_one_poll(dst_ctx, files, req, task);
+			if (ret < 0)
+				goto out_unlock;
+		}
+	}
+
+out_unlock:
+	if (!ret && io_uring_poll_req_count(dst_ctx) !=
+		    io_uring_poll_req_count(src_ctx))
+		ret = -EUCLEAN;
+	if (dst_ctx != src_ctx)
+		mutex_unlock(&dst_ctx->uring_lock);
+	mutex_unlock(&src_ctx->uring_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(io_uring_file_replay);
 
 /*
  * Sets up an aio uring context, and returns the fd. Applications asks for a

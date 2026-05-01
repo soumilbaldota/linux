@@ -14,6 +14,7 @@
 
 /* Forward declarations to avoid compiler errors */
 struct file;
+struct files_struct;
 
 
 #ifdef CONFIG_EPOLL
@@ -59,6 +60,11 @@ static inline void eventpoll_release(struct file *file)
 
 int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
 		 bool nonblock);
+
+/* Create a new, empty epoll file (no fd installed). Used by superfork. */
+struct file *epoll_file_create(int flags);
+int epoll_file_replay(struct file *dst_file, struct file *src_file,
+		      struct files_struct *files);
 
 /* Tells if the epoll_ctl(2) operation needs an event copy from userspace */
 static inline int ep_op_has_event(int op)

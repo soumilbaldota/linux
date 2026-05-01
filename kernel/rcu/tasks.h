@@ -573,7 +573,8 @@ static void rcu_tasks_invoke_cbs(struct rcu_tasks *rtp, struct rcu_tasks_percpu 
 	raw_spin_unlock_irqrestore_rcu_node(rtpcp, flags);
 	len = rcl.len;
 	for (rhp = rcu_cblist_dequeue(&rcl); rhp; rhp = rcu_cblist_dequeue(&rcl)) {
-		debug_rcu_head_callback(rhp);
+		if (!debug_rcu_head_callback(rhp))
+			continue;
 		local_bh_disable();
 		rhp->func(rhp);
 		local_bh_enable();

@@ -158,6 +158,10 @@ static int rseq_validate_ro_fields(struct task_struct *t)
  *   F1. <failure>
  */
 
+static void superfork_log_rseq_error(struct task_struct *t, const char *stage,
+				     int ret, struct pt_regs *regs,
+				     int sig, u64 rseq_cs_ptr);
+
 static int rseq_update_cpu_node_id(struct task_struct *t)
 {
 	struct rseq __user *rseq = t->rseq;
@@ -168,11 +172,17 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 	/*
 	 * Validate read-only rseq fields.
 	 */
-	if (rseq_validate_ro_fields(t))
+	if (rseq_validate_ro_fields(t)) {
+		superfork_log_rseq_error(t, "update-validate-ro-fields",
+					 -EFAULT, NULL, 0, 0);
 		goto efault;
+	}
 	WARN_ON_ONCE((int) mm_cid < 0);
-	if (!user_write_access_begin(rseq, t->rseq_len))
+	if (!user_write_access_begin(rseq, t->rseq_len)) {
+		superfork_log_rseq_error(t, "update-user-write-access-begin",
+					 -EFAULT, NULL, 0, 0);
 		goto efault;
+	}
 
 	rseq_unsafe_put_user(t, cpu_id, cpu_id_start, efault_end);
 	rseq_unsafe_put_user(t, cpu_id, cpu_id, efault_end);
@@ -191,6 +201,7 @@ static int rseq_update_cpu_node_id(struct task_struct *t)
 efault_end:
 	user_write_access_end();
 efault:
+	superfork_log_rseq_error(t, "update-efault", -EFAULT, NULL, 0, 0);
 	return -EFAULT;
 }
 
@@ -268,8 +279,10 @@ static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
 	int ret;
 
 	ret = rseq_get_rseq_cs_ptr_val(t->rseq, &ptr);
-	if (ret)
+	if (ret) {
+		superfork_log_rseq_error(t, "get-rseq-cs-ptr", ret, NULL, 0, 0);
 		return ret;
+	}
 
 	/* If the rseq_cs pointer is NULL, return a cleared struct rseq_cs. */
 	if (!ptr) {
@@ -277,36 +290,79 @@ static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
 		return 0;
 	}
 	/* Check that the pointer value fits in the user-space process space. */
-	if (ptr >= TASK_SIZE)
+	if (ptr >= TASK_SIZE) {
+		superfork_log_rseq_error(t, "get-rseq-cs-ptr-invalid",
+					 -EINVAL, NULL, 0, ptr);
 		return -EINVAL;
+	}
 	urseq_cs = (struct rseq_cs __user *)(unsigned long)ptr;
-	if (copy_from_user(rseq_cs, urseq_cs, sizeof(*rseq_cs)))
+	if (copy_from_user(rseq_cs, urseq_cs, sizeof(*rseq_cs))) {
+		superfork_log_rseq_error(t, "copy-rseq-cs", -EFAULT, NULL, 0,
+					 ptr);
 		return -EFAULT;
+	}
 
 	if (rseq_cs->start_ip >= TASK_SIZE ||
 	    rseq_cs->start_ip + rseq_cs->post_commit_offset >= TASK_SIZE ||
 	    rseq_cs->abort_ip >= TASK_SIZE ||
-	    rseq_cs->version > 0)
+	    rseq_cs->version > 0) {
+		superfork_log_rseq_error(t, "validate-rseq-cs", -EINVAL, NULL,
+					 0, ptr);
 		return -EINVAL;
+	}
 	/* Check for overflow. */
-	if (rseq_cs->start_ip + rseq_cs->post_commit_offset < rseq_cs->start_ip)
+	if (rseq_cs->start_ip + rseq_cs->post_commit_offset < rseq_cs->start_ip) {
+		superfork_log_rseq_error(t, "validate-rseq-cs-overflow",
+					 -EINVAL, NULL, 0, ptr);
 		return -EINVAL;
+	}
 	/* Ensure that abort_ip is not in the critical section. */
-	if (rseq_cs->abort_ip - rseq_cs->start_ip < rseq_cs->post_commit_offset)
+	if (rseq_cs->abort_ip - rseq_cs->start_ip < rseq_cs->post_commit_offset) {
+		superfork_log_rseq_error(t, "validate-rseq-cs-abort-ip",
+					 -EINVAL, NULL, 0, ptr);
 		return -EINVAL;
+	}
 
 	usig = (u32 __user *)(unsigned long)(rseq_cs->abort_ip - sizeof(u32));
 	ret = get_user(sig, usig);
-	if (ret)
+	if (ret) {
+		superfork_log_rseq_error(t, "get-rseq-signature", ret, NULL, 0,
+					 ptr);
 		return ret;
+	}
 
 	if (current->rseq_sig != sig) {
 		printk_ratelimited(KERN_WARNING
 			"Possible attack attempt. Unexpected rseq signature 0x%x, expecting 0x%x (pid=%d, addr=%p).\n",
 			sig, current->rseq_sig, current->pid, usig);
+		superfork_log_rseq_error(t, "rseq-signature-mismatch", -EINVAL,
+					 NULL, sig, ptr);
 		return -EINVAL;
 	}
 	return 0;
+}
+
+static bool superfork_rseq_debug_target(struct task_struct *t)
+{
+	return !strcmp(t->comm, "containerd-shim") ||
+	       !strncmp(t->comm, "virtiofsd", 9) ||
+	       !strncmp(t->comm, "qemu-system-x86", 15) ||
+	       !strcmp(t->comm, "vring_worker");
+}
+
+static void superfork_log_rseq_error(struct task_struct *t, const char *stage,
+				     int ret, struct pt_regs *regs,
+				     int sig, u64 rseq_cs_ptr)
+{
+	if (!superfork_rseq_debug_target(t))
+		return;
+
+	pr_info("superfork-rseq: pid=%d comm=%s stage=%s ret=%d sig=%d rseq=%px rseq_len=%u rseq_sig=0x%x rseq_cs_ptr=0x%llx cpu_id=%d node_id=%d regs_ip=0x%lx regs_sp=0x%lx\n",
+		t->pid, t->comm, stage, ret, sig, t->rseq, t->rseq_len,
+		t->rseq_sig, rseq_cs_ptr, raw_smp_processor_id(),
+		cpu_to_node(raw_smp_processor_id()),
+		regs ? instruction_pointer(regs) : 0UL,
+		regs ? user_stack_pointer(regs) : 0UL);
 }
 
 static bool rseq_warn_flags(const char *str, u32 flags)
@@ -334,8 +390,11 @@ static int rseq_need_restart(struct task_struct *t, u32 cs_flags)
 
 	/* Get thread flags. */
 	ret = get_user(flags, &t->rseq->flags);
-	if (ret)
+	if (ret) {
+		superfork_log_rseq_error(t, "need-restart-get-flags", ret,
+					 NULL, 0, 0);
 		return ret;
+	}
 
 	if (rseq_warn_flags("rseq", flags))
 		return -EINVAL;
@@ -445,6 +504,7 @@ void __rseq_handle_notify_resume(struct ksignal *ksig, struct pt_regs *regs)
 
 error:
 	sig = ksig ? ksig->sig : 0;
+	superfork_log_rseq_error(t, "notify-resume-error", ret, regs, sig, 0);
 	force_sigsegv(sig);
 }
 

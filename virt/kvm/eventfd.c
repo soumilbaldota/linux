@@ -353,7 +353,8 @@ void __weak kvm_arch_update_irqfd_routing(struct kvm_kernel_irqfd *irqfd,
 #endif
 
 static int
-kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+__kvm_irqfd_assign(struct kvm *kvm, u32 gsi, struct file *eventfd_file,
+		   struct file *resample_file)
 {
 	struct kvm_kernel_irqfd *irqfd;
 	struct eventfd_ctx *eventfd = NULL, *resamplefd = NULL;
@@ -365,27 +366,38 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 	if (!kvm_arch_intc_initialized(kvm))
 		return -EAGAIN;
 
-	if (!kvm_arch_irqfd_allowed(kvm, args))
-		return -EINVAL;
+	if (!eventfd_file)
+		return -EBADF;
+
+	if (resample_file) {
+		struct kvm_irqfd args = {
+			.gsi = gsi,
+			.flags = KVM_IRQFD_FLAG_RESAMPLE,
+		};
+
+		if (!kvm_arch_irqfd_allowed(kvm, &args))
+			return -EINVAL;
+	} else {
+		struct kvm_irqfd args = {
+			.gsi = gsi,
+		};
+
+		if (!kvm_arch_irqfd_allowed(kvm, &args))
+			return -EINVAL;
+	}
 
 	irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL_ACCOUNT);
 	if (!irqfd)
 		return -ENOMEM;
 
 	irqfd->kvm = kvm;
-	irqfd->gsi = args->gsi;
+	irqfd->gsi = gsi;
 	INIT_LIST_HEAD(&irqfd->list);
 	INIT_WORK(&irqfd->inject, irqfd_inject);
 	INIT_WORK(&irqfd->shutdown, irqfd_shutdown);
 	seqcount_spinlock_init(&irqfd->irq_entry_sc, &kvm->irqfds.lock);
 
-	CLASS(fd, f)(args->fd);
-	if (fd_empty(f)) {
-		ret = -EBADF;
-		goto out;
-	}
-
-	eventfd = eventfd_ctx_fileget(fd_file(f));
+	eventfd = eventfd_ctx_fileget(eventfd_file);
 	if (IS_ERR(eventfd)) {
 		ret = PTR_ERR(eventfd);
 		goto out;
@@ -393,10 +405,10 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 
 	irqfd->eventfd = eventfd;
 
-	if (args->flags & KVM_IRQFD_FLAG_RESAMPLE) {
+	if (resample_file) {
 		struct kvm_kernel_irqfd_resampler *resampler;
 
-		resamplefd = eventfd_ctx_fdget(args->resamplefd);
+		resamplefd = eventfd_ctx_fileget(resample_file);
 		if (IS_ERR(resamplefd)) {
 			ret = PTR_ERR(resamplefd);
 			goto fail;
@@ -464,7 +476,7 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 	irqfd_pt.kvm = kvm;
 	init_poll_funcptr(&irqfd_pt.pt, kvm_irqfd_register);
 
-	events = vfs_poll(fd_file(f), &irqfd_pt.pt);
+	events = vfs_poll(eventfd_file, &irqfd_pt.pt);
 
 	ret = irqfd_pt.ret;
 	if (ret)
@@ -504,6 +516,33 @@ fail:
 out:
 	kfree(irqfd);
 	return ret;
+}
+
+static int
+kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+{
+	struct file *resample_file = NULL;
+
+	if (!kvm_arch_intc_initialized(kvm))
+		return -EAGAIN;
+
+	if (!kvm_arch_irqfd_allowed(kvm, args))
+		return -EINVAL;
+
+	CLASS(fd, f)(args->fd);
+	if (fd_empty(f)) {
+		return -EBADF;
+	}
+
+	if (args->flags & KVM_IRQFD_FLAG_RESAMPLE) {
+		CLASS(fd, rf)(args->resamplefd);
+
+		if (fd_empty(rf))
+			return -EBADF;
+		resample_file = fd_file(rf);
+	}
+
+	return __kvm_irqfd_assign(kvm, args->gsi, fd_file(f), resample_file);
 }
 
 bool kvm_irq_has_notifier(struct kvm *kvm, unsigned irqchip, unsigned pin)
@@ -700,6 +739,148 @@ bool kvm_notify_irqfd_resampler(struct kvm *kvm,
 	return false;
 }
 
+struct kvm_superfork_irqfd_state {
+	int gsi;
+	struct eventfd_ctx *eventfd;
+	struct eventfd_ctx *resamplefd;
+};
+
+static int kvm_superfork_build_irq_routing_entries(struct kvm *src,
+					 struct kvm_irq_routing_entry **entries_out,
+					 unsigned int *nr_out)
+{
+	struct kvm_irq_routing_table *rt;
+	struct kvm_irq_routing_entry *entries = NULL;
+	struct kvm_kernel_irq_routing_entry *src_entry;
+	unsigned int nr = 0, idx = 0, gsi;
+	int srcu_idx;
+	int ret = 0;
+
+	*entries_out = NULL;
+	*nr_out = 0;
+
+	srcu_idx = srcu_read_lock(&src->irq_srcu);
+	rt = srcu_dereference(src->irq_routing, &src->irq_srcu);
+	if (!rt)
+		goto out_unlock;
+
+	for (gsi = 0; gsi < rt->nr_rt_entries; gsi++) {
+		hlist_for_each_entry(src_entry, &rt->map[gsi], link)
+			nr++;
+	}
+
+	if (!nr)
+		goto out_unlock;
+
+	entries = kcalloc(nr, sizeof(*entries), GFP_KERNEL_ACCOUNT);
+	if (!entries) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	for (gsi = 0; gsi < rt->nr_rt_entries; gsi++) {
+		hlist_for_each_entry(src_entry, &rt->map[gsi], link) {
+			struct kvm_irq_routing_entry *dst_entry = &entries[idx++];
+
+			dst_entry->gsi = src_entry->gsi;
+			dst_entry->type = src_entry->type;
+
+			switch (src_entry->type) {
+			case KVM_IRQ_ROUTING_IRQCHIP:
+				dst_entry->u.irqchip.irqchip = src_entry->irqchip.irqchip;
+				dst_entry->u.irqchip.pin = src_entry->irqchip.pin;
+				/*
+				 * x86 kvm_set_routing_entry() bakes a +8 offset into the
+				 * kernel-side pin for PIC_SLAVE (so kernel pins 8-15 map
+				 * to userspace pins 0-7). Undo that here so the entry we
+				 * feed back into kvm_set_irq_routing() passes its
+				 * userspace-ABI validation (pin < PIC_NUM_PINS/2).
+				 */
+				if (src_entry->irqchip.irqchip == KVM_IRQCHIP_PIC_SLAVE)
+					dst_entry->u.irqchip.pin -= 8;
+				break;
+			case KVM_IRQ_ROUTING_MSI:
+				dst_entry->flags = src_entry->msi.flags;
+				dst_entry->u.msi.address_lo = src_entry->msi.address_lo;
+				dst_entry->u.msi.address_hi = src_entry->msi.address_hi;
+				dst_entry->u.msi.data = src_entry->msi.data;
+				dst_entry->u.msi.devid = src_entry->msi.devid;
+				break;
+			case KVM_IRQ_ROUTING_S390_ADAPTER:
+				dst_entry->u.adapter.ind_addr = src_entry->adapter.ind_addr;
+				dst_entry->u.adapter.summary_addr = src_entry->adapter.summary_addr;
+				dst_entry->u.adapter.ind_offset = src_entry->adapter.ind_offset;
+				dst_entry->u.adapter.summary_offset = src_entry->adapter.summary_offset;
+				dst_entry->u.adapter.adapter_id = src_entry->adapter.adapter_id;
+				break;
+			case KVM_IRQ_ROUTING_HV_SINT:
+				dst_entry->u.hv_sint.vcpu = src_entry->hv_sint.vcpu;
+				dst_entry->u.hv_sint.sint = src_entry->hv_sint.sint;
+				break;
+			case KVM_IRQ_ROUTING_XEN_EVTCHN:
+				dst_entry->u.xen_evtchn.port = src_entry->xen_evtchn.port;
+				dst_entry->u.xen_evtchn.vcpu = src_entry->xen_evtchn.vcpu_id;
+				dst_entry->u.xen_evtchn.priority = src_entry->xen_evtchn.priority;
+				break;
+			default:
+				ret = -EOPNOTSUPP;
+				goto out_free;
+			}
+		}
+	}
+
+out_free:
+	if (ret) {
+		kfree(entries);
+		entries = NULL;
+		nr = 0;
+	}
+out_unlock:
+	srcu_read_unlock(&src->irq_srcu, srcu_idx);
+	*entries_out = entries;
+	*nr_out = nr;
+	return ret;
+}
+
+static int kvm_superfork_collect_irqfds(struct kvm *src,
+					struct kvm_superfork_irqfd_state **states_out,
+					unsigned int *count_out)
+{
+	struct kvm_superfork_irqfd_state *states = NULL;
+	struct kvm_kernel_irqfd *irqfd;
+	unsigned int count = 0;
+	unsigned int idx = 0;
+
+	*states_out = NULL;
+	*count_out = 0;
+
+	spin_lock_irq(&src->irqfds.lock);
+	list_for_each_entry(irqfd, &src->irqfds.items, list)
+		count++;
+	spin_unlock_irq(&src->irqfds.lock);
+
+	if (!count)
+		return 0;
+
+	states = kcalloc(count, sizeof(*states), GFP_KERNEL_ACCOUNT);
+	if (!states)
+		return -ENOMEM;
+
+	spin_lock_irq(&src->irqfds.lock);
+	list_for_each_entry(irqfd, &src->irqfds.items, list) {
+		states[idx].gsi = irqfd->gsi;
+		states[idx].eventfd = irqfd->eventfd;
+		states[idx].resamplefd = irqfd->resampler ? irqfd->resamplefd : NULL;
+		idx++;
+	}
+	spin_unlock_irq(&src->irqfds.lock);
+
+	*states_out = states;
+	*count_out = count;
+	return 0;
+}
+
+
 /*
  * create a host-wide workqueue for issuing deferred shutdown requests
  * aggregated from all vm* instances. We need our own isolated
@@ -857,16 +1038,18 @@ static enum kvm_bus ioeventfd_bus_from_flags(__u32 flags)
 	return KVM_MMIO_BUS;
 }
 
-static int kvm_assign_ioeventfd_idx(struct kvm *kvm,
-				enum kvm_bus bus_idx,
-				struct kvm_ioeventfd *args)
+static int __kvm_assign_ioeventfd_bus(struct kvm *kvm, enum kvm_bus bus_idx,
+				      struct file *eventfd_file, u64 addr, int len,
+				      bool wildcard, u64 datamatch)
 {
-
 	struct eventfd_ctx *eventfd;
 	struct _ioeventfd *p;
 	int ret;
 
-	eventfd = eventfd_ctx_fdget(args->fd);
+	if (!eventfd_file)
+		return -EBADF;
+
+	eventfd = eventfd_ctx_fileget(eventfd_file);
 	if (IS_ERR(eventfd))
 		return PTR_ERR(eventfd);
 
@@ -877,14 +1060,13 @@ static int kvm_assign_ioeventfd_idx(struct kvm *kvm,
 	}
 
 	INIT_LIST_HEAD(&p->list);
-	p->addr    = args->addr;
+	p->addr    = addr;
 	p->bus_idx = bus_idx;
-	p->length  = args->len;
+	p->length  = len;
 	p->eventfd = eventfd;
 
-	/* The datamatch feature is optional, otherwise this is a wildcard */
-	if (args->flags & KVM_IOEVENTFD_FLAG_DATAMATCH)
-		p->datamatch = args->datamatch;
+	if (!wildcard)
+		p->datamatch = datamatch;
 	else
 		p->wildcard = true;
 
@@ -917,6 +1099,200 @@ unlock_fail:
 fail:
 	eventfd_ctx_put(eventfd);
 
+	return ret;
+}
+
+static int kvm_assign_ioeventfd_idx(struct kvm *kvm,
+				enum kvm_bus bus_idx,
+				struct kvm_ioeventfd *args)
+{
+	bool wildcard = !(args->flags & KVM_IOEVENTFD_FLAG_DATAMATCH);
+
+	CLASS(fd, f)(args->fd);
+	if (fd_empty(f))
+		return -EBADF;
+
+	return __kvm_assign_ioeventfd_bus(kvm, bus_idx, fd_file(f),
+						  args->addr, args->len,
+						  wildcard, args->datamatch);
+}
+
+struct kvm_superfork_ioeventfd_state {
+	u64 addr;
+	u64 datamatch;
+	int length;
+	u8 bus_idx;
+	bool wildcard;
+	struct eventfd_ctx *eventfd;
+};
+
+static int kvm_superfork_collect_ioeventfds(struct kvm *src,
+				struct kvm_superfork_ioeventfd_state **states_out,
+				unsigned int *count_out)
+{
+	struct kvm_superfork_ioeventfd_state *states = NULL;
+	struct _ioeventfd *ioeventfd;
+	unsigned int count = 0;
+	unsigned int idx = 0;
+
+	*states_out = NULL;
+	*count_out = 0;
+
+	mutex_lock(&src->slots_lock);
+	list_for_each_entry(ioeventfd, &src->ioeventfds, list)
+		count++;
+	mutex_unlock(&src->slots_lock);
+
+	if (!count)
+		return 0;
+
+	states = kcalloc(count, sizeof(*states), GFP_KERNEL_ACCOUNT);
+	if (!states)
+		return -ENOMEM;
+
+	mutex_lock(&src->slots_lock);
+	list_for_each_entry(ioeventfd, &src->ioeventfds, list) {
+		states[idx].addr = ioeventfd->addr;
+		states[idx].datamatch = ioeventfd->datamatch;
+		states[idx].length = ioeventfd->length;
+		states[idx].bus_idx = ioeventfd->bus_idx;
+		states[idx].wildcard = ioeventfd->wildcard;
+		states[idx].eventfd = ioeventfd->eventfd;
+		idx++;
+	}
+	mutex_unlock(&src->slots_lock);
+
+	*states_out = states;
+	*count_out = count;
+	return 0;
+}
+
+int kvm_superfork_restore_vm_io(struct kvm *dst, struct kvm *src,
+				kvm_superfork_resolve_eventfd_file_t resolve,
+				void *opaque)
+{
+	struct kvm_superfork_irqfd_state *irqfds = NULL;
+	struct kvm_superfork_ioeventfd_state *ioeventfds = NULL;
+	struct kvm_irq_routing_entry *routing = NULL;
+	unsigned int irqfd_count = 0;
+	unsigned int ioeventfd_count = 0;
+	unsigned int routing_count = 0;
+	unsigned int i;
+	int ret;
+
+	if (!dst || !src || !resolve)
+		return -EINVAL;
+
+	ret = kvm_superfork_build_irq_routing_entries(src, &routing, &routing_count);
+	if (ret) {
+		pr_err("superfork: restore_vm_io: build_irq_routing_entries failed: %d\n",
+		       ret);
+		goto out;
+	}
+
+	pr_info("superfork: restore_vm_io: routing_count=%u\n", routing_count);
+
+	if (routing_count) {
+		for (i = 0; i < routing_count; i++) {
+			pr_info("superfork: restore_vm_io: route[%u] gsi=%u type=%u flags=0x%x\n",
+				i, routing[i].gsi, routing[i].type, routing[i].flags);
+		}
+
+		ret = kvm_set_irq_routing(dst, routing, routing_count, 0);
+		if (ret) {
+			pr_err("superfork: restore_vm_io: kvm_set_irq_routing failed: %d (count=%u)\n",
+			       ret, routing_count);
+			goto out;
+		}
+	}
+
+	ret = kvm_superfork_collect_ioeventfds(src, &ioeventfds, &ioeventfd_count);
+	if (ret) {
+		pr_err("superfork: restore_vm_io: collect_ioeventfds failed: %d\n",
+		       ret);
+		goto out;
+	}
+
+	pr_info("superfork: restore_vm_io: ioeventfd_count=%u\n", ioeventfd_count);
+
+	for (i = 0; i < ioeventfd_count; i++) {
+		struct file *eventfd_file;
+
+		eventfd_file = resolve(opaque, ioeventfds[i].eventfd);
+		if (!eventfd_file) {
+			pr_err("superfork: restore_vm_io: ioeventfd[%u] resolve failed (eventfd_ctx=%p)\n",
+			       i, ioeventfds[i].eventfd);
+			ret = -ENOENT;
+			goto out;
+		}
+
+		ret = __kvm_assign_ioeventfd_bus(dst, ioeventfds[i].bus_idx,
+						 eventfd_file,
+						 ioeventfds[i].addr,
+						 ioeventfds[i].length,
+						 ioeventfds[i].wildcard,
+						 ioeventfds[i].datamatch);
+		fput(eventfd_file);
+		if (ret) {
+			pr_err("superfork: restore_vm_io: ioeventfd[%u] assign failed: %d (bus=%u addr=0x%llx len=%d wildcard=%d datamatch=0x%llx)\n",
+			       i, ret, ioeventfds[i].bus_idx,
+			       (unsigned long long)ioeventfds[i].addr,
+			       ioeventfds[i].length,
+			       (int)ioeventfds[i].wildcard,
+			       (unsigned long long)ioeventfds[i].datamatch);
+			goto out;
+		}
+	}
+
+	ret = kvm_superfork_collect_irqfds(src, &irqfds, &irqfd_count);
+	if (ret) {
+		pr_err("superfork: restore_vm_io: collect_irqfds failed: %d\n",
+		       ret);
+		goto out;
+	}
+
+	pr_info("superfork: restore_vm_io: irqfd_count=%u\n", irqfd_count);
+
+	for (i = 0; i < irqfd_count; i++) {
+		struct file *eventfd_file;
+		struct file *resample_file = NULL;
+
+		eventfd_file = resolve(opaque, irqfds[i].eventfd);
+		if (!eventfd_file) {
+			pr_err("superfork: restore_vm_io: irqfd[%u] gsi=%d resolve(eventfd) failed (ctx=%p)\n",
+			       i, irqfds[i].gsi, irqfds[i].eventfd);
+			ret = -ENOENT;
+			goto out;
+		}
+
+		if (irqfds[i].resamplefd) {
+			resample_file = resolve(opaque, irqfds[i].resamplefd);
+			if (!resample_file) {
+				pr_err("superfork: restore_vm_io: irqfd[%u] gsi=%d resolve(resamplefd) failed (ctx=%p)\n",
+				       i, irqfds[i].gsi, irqfds[i].resamplefd);
+				fput(eventfd_file);
+				ret = -ENOENT;
+				goto out;
+			}
+		}
+
+		ret = __kvm_irqfd_assign(dst, irqfds[i].gsi, eventfd_file,
+					 resample_file);
+		if (resample_file)
+			fput(resample_file);
+		fput(eventfd_file);
+		if (ret) {
+			pr_err("superfork: restore_vm_io: irqfd[%u] assign failed: %d (gsi=%d resample=%d)\n",
+			       i, ret, irqfds[i].gsi,
+			       irqfds[i].resamplefd ? 1 : 0);
+			goto out;
+		}
+	}
+
+out:
+	kfree(irqfds);
+	kfree(ioeventfds);
+	kfree(routing);
 	return ret;
 }
 

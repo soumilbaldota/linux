@@ -742,6 +742,20 @@ static inline void put_signal_struct(struct signal_struct *sig)
 
 void __put_task_struct(struct task_struct *tsk)
 {
+	if (task_active_pid_ns(tsk) != &init_pid_ns) {
+		int usage = refcount_read(&tsk->usage);
+		int rcu_users = refcount_read(&tsk->rcu_users);
+		int stack_refs = refcount_read(&tsk->stack_refcount);
+
+		if (!tsk->exit_state || usage || stack_refs) {
+			pr_warn("superfork-put-task: pid=%d tgid=%d comm=%s exit_state=%d state=0x%x usage=%d rcu_users=%d stack_ref=%d group_leader=%d real_parent=%d\n",
+				tsk->pid, tsk->tgid, tsk->comm, tsk->exit_state,
+				READ_ONCE(tsk->__state), usage, rcu_users, stack_refs,
+				tsk->group_leader ? tsk->group_leader->pid : -1,
+				tsk->real_parent ? tsk->real_parent->pid : -1);
+		}
+	}
+
 	WARN_ON(!tsk->exit_state);
 	WARN_ON(refcount_read(&tsk->usage));
 	WARN_ON(tsk == current);

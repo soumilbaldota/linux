@@ -12,6 +12,13 @@
 #include "io_uring.h"
 #include "tctx.h"
 
+static inline bool io_superfork_trace_task(const struct task_struct *task)
+{
+	return task &&
+	       (!strcmp(task->comm, "qemu-system-x86") ||
+		!strncmp(task->comm, "virtiofsd", 9));
+}
+
 static struct io_wq *io_init_wq_offload(struct io_ring_ctx *ctx,
 					struct task_struct *task)
 {
@@ -101,18 +108,23 @@ __cold int io_uring_alloc_task_context(struct task_struct *task,
 	return 0;
 }
 
-int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
+static int __io_uring_add_task_tctx_node(struct task_struct *task,
+					 struct io_ring_ctx *ctx,
+					 bool remember_last)
 {
-	struct io_uring_task *tctx = current->io_uring;
+	struct io_uring_task *tctx = task->io_uring;
 	struct io_tctx_node *node;
 	int ret;
 
 	if (unlikely(!tctx)) {
-		ret = io_uring_alloc_task_context(current, ctx);
+		ret = io_uring_alloc_task_context(task, ctx);
 		if (unlikely(ret))
 			return ret;
 
-		tctx = current->io_uring;
+		tctx = task->io_uring;
+		if (io_superfork_trace_task(task))
+			pr_info("io_uring: new_tctx owner=%s/%d current=%s/%d ctx=%p\n",
+				task->comm, task->pid, current->comm, current->pid, ctx);
 		if (ctx->iowq_limits_set) {
 			unsigned int limits[2] = { ctx->iowq_limits[0],
 						   ctx->iowq_limits[1], };
@@ -122,12 +134,13 @@ int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
 				return ret;
 		}
 	}
+
 	if (!xa_load(&tctx->xa, (unsigned long)ctx)) {
 		node = kmalloc(sizeof(*node), GFP_KERNEL);
 		if (!node)
 			return -ENOMEM;
 		node->ctx = ctx;
-		node->task = current;
+		node->task = task;
 
 		ret = xa_err(xa_store(&tctx->xa, (unsigned long)ctx,
 					node, GFP_KERNEL));
@@ -139,24 +152,37 @@ int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
 		mutex_lock(&ctx->uring_lock);
 		list_add(&node->ctx_node, &ctx->tctx_list);
 		mutex_unlock(&ctx->uring_lock);
+
+		if (io_superfork_trace_task(task))
+			pr_info("io_uring: add_tctx_node owner=%s/%d current=%s/%d ctx=%p remember_last=%d\n",
+				task->comm, task->pid, current->comm, current->pid,
+				ctx, remember_last);
 	}
+
+	if (remember_last)
+		tctx->last = ctx;
+
 	return 0;
+}
+
+int io_uring_add_task_tctx_node(struct task_struct *task,
+				struct io_ring_ctx *ctx)
+{
+	return __io_uring_add_task_tctx_node(task, ctx, false);
+}
+
+int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
+{
+	return __io_uring_add_task_tctx_node(current, ctx, false);
 }
 
 int __io_uring_add_tctx_node_from_submit(struct io_ring_ctx *ctx)
 {
-	int ret;
-
 	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER
 	    && ctx->submitter_task != current)
 		return -EEXIST;
 
-	ret = __io_uring_add_tctx_node(ctx);
-	if (ret)
-		return ret;
-
-	current->io_uring->last = ctx;
-	return 0;
+	return __io_uring_add_task_tctx_node(current, ctx, true);
 }
 
 /*

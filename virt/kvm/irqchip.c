@@ -201,17 +201,26 @@ int kvm_set_irq_routing(struct kvm *kvm,
 		r = -EINVAL;
 		switch (ue->type) {
 		case KVM_IRQ_ROUTING_MSI:
-			if (ue->flags & ~KVM_MSI_VALID_DEVID)
+			if (ue->flags & ~KVM_MSI_VALID_DEVID) {
+				pr_err("kvm: set_irq_routing: entry[%u] gsi=%u type=MSI flags=0x%x rejected (bad flags)\n",
+				       i, ue->gsi, ue->flags);
 				goto free_entry;
+			}
 			break;
 		default:
-			if (ue->flags)
+			if (ue->flags) {
+				pr_err("kvm: set_irq_routing: entry[%u] gsi=%u type=%u flags=0x%x rejected (non-zero flags)\n",
+				       i, ue->gsi, ue->type, ue->flags);
 				goto free_entry;
+			}
 			break;
 		}
 		r = setup_routing_entry(kvm, new, e, ue);
-		if (r)
+		if (r) {
+			pr_err("kvm: set_irq_routing: entry[%u] gsi=%u type=%u setup_routing_entry failed: %d\n",
+			       i, ue->gsi, ue->type, r);
 			goto free_entry;
+		}
 		++ue;
 	}
 

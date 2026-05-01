@@ -71,11 +71,15 @@
 #include <linux/unwind_deferred.h>
 #include <linux/uaccess.h>
 #include <linux/pidfs.h>
+#include <linux/superfork.h>
 
 #include <uapi/linux/wait.h>
 
 #include <asm/unistd.h>
 #include <asm/mmu_context.h>
+#ifdef CONFIG_X86
+#include <asm/processor.h>
+#endif
 
 #include "exit.h"
 
@@ -130,6 +134,25 @@ late_initcall(kernel_exit_sysfs_init);
 struct release_task_post {
 	struct pid *pids[PIDTYPE_MAX];
 };
+
+static uid_t exit_task_uid_or_root(struct task_struct *p, const char *where)
+{
+	const struct cred *cred;
+	kuid_t uid = GLOBAL_ROOT_UID;
+
+	rcu_read_lock();
+	cred = __task_cred(p);
+	if (unlikely(!cred)) {
+		pr_warn_ratelimited("exit: task %d (%s) has NULL real_cred in %s, exit_state=%d state=0x%x\n",
+				    p->pid, p->comm, where,
+				    p->exit_state, READ_ONCE(p->__state));
+	} else {
+		uid = cred->uid;
+	}
+	rcu_read_unlock();
+
+	return from_kuid_munged(current_user_ns(), uid);
+}
 
 static void __unhash_process(struct release_task_post *post, struct task_struct *p,
 			     bool group_dead)
@@ -224,6 +247,18 @@ static void delayed_put_task_struct(struct rcu_head *rhp)
 {
 	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
 
+	if (task_active_pid_ns(tsk) != &init_pid_ns) {
+		int usage = refcount_read(&tsk->usage);
+		int rcu_users = refcount_read(&tsk->rcu_users);
+		int stack_refs = refcount_read(&tsk->stack_refcount);
+
+		pr_info("superfork-delayed-put: pid=%d tgid=%d comm=%s exit_state=%d state=0x%x usage=%d rcu_users=%d stack_ref=%d group_leader=%d real_parent=%d\n",
+			tsk->pid, tsk->tgid, tsk->comm, tsk->exit_state,
+			READ_ONCE(tsk->__state), usage, rcu_users, stack_refs,
+			tsk->group_leader ? tsk->group_leader->pid : -1,
+			tsk->real_parent ? tsk->real_parent->pid : -1);
+	}
+
 	kprobe_flush_task(tsk);
 	rethook_flush_task(tsk);
 	perf_event_delayed_put(tsk);
@@ -246,6 +281,7 @@ void release_task(struct task_struct *p)
 	struct release_task_post post;
 	struct task_struct *leader;
 	struct pid *thread_pid;
+	const struct cred *cred;
 	int zap_leader;
 repeat:
 	memset(&post, 0, sizeof(post));
@@ -253,7 +289,16 @@ repeat:
 	/* don't need to get the RCU readlock here - the process is dead and
 	 * can't be modifying its own credentials. But shut RCU-lockdep up */
 	rcu_read_lock();
-	dec_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
+	cred = __task_cred(p);
+	if (unlikely(!cred))
+		cred = rcu_dereference(p->cred);
+	if (likely(cred)) {
+		dec_rlimit_ucounts(cred->ucounts, UCOUNT_RLIMIT_NPROC, 1);
+	} else {
+		pr_warn_ratelimited("exit: task %d (%s) has NULL cred pointers in release_task, exit_state=%d state=0x%x\n",
+				    p->pid, p->comm, p->exit_state,
+				    READ_ONCE(p->__state));
+	}
 	rcu_read_unlock();
 
 	pidfs_exit(p);
@@ -275,6 +320,12 @@ repeat:
 	leader = p->group_leader;
 	if (leader != p && thread_group_empty(leader)
 			&& leader->exit_state == EXIT_ZOMBIE) {
+		if (task_active_pid_ns(leader) != &init_pid_ns) {
+			pr_info("superfork-release: pid=%d comm=%s reaping leader pid=%d comm=%s leader_real_cred=%px leader_cred=%px leader_state=0x%x leader_exit_state=%d\n",
+				p->pid, p->comm, leader->pid, leader->comm,
+				leader->real_cred, leader->cred,
+				READ_ONCE(leader->__state), leader->exit_state);
+		}
 		/* for pidfs_exit() and do_notify_parent() */
 		if (leader->signal->flags & SIGNAL_GROUP_EXIT)
 			leader->exit_code = leader->signal->group_exit_code;
@@ -289,6 +340,7 @@ repeat:
 	}
 
 	write_unlock_irq(&tasklist_lock);
+	superfork_release_placeholder_peers(p);
 	/* @thread_pid can't go away until free_pids() below */
 	proc_flush_pid(thread_pid);
 	add_device_randomness(&p->se.sum_exec_runtime,
@@ -734,11 +786,76 @@ static void forget_original_parent(struct task_struct *father,
  * Send signals to all our closest relatives so that they know
  * to properly mourn us..
  */
+#ifdef CONFIG_X86
+static void superfork_log_segv_context(struct task_struct *tsk,
+				       const char *role,
+				       unsigned int code)
+{
+	unsigned int sig = code & 0x7f;
+	struct pt_regs *regs;
+
+	if ((sig != SIGSEGV && sig != SIGBUS) || (tsk->flags & PF_KTHREAD))
+		return;
+
+	regs = task_pt_regs(tsk);
+
+	pr_info("superfork-exit:  %s-fault pid=%d comm=%s sig=%u core=%u ip=0x%lx sp=0x%lx cr2=0x%lx trap=%lu err=0x%lx\n",
+		role, tsk->pid, tsk->comm, sig, !!(code & 0x80),
+		regs ? regs->ip : 0UL,
+		regs ? regs->sp : 0UL,
+		tsk->thread.cr2,
+		tsk->thread.trap_nr,
+		tsk->thread.error_code);
+}
+#else
+static inline void superfork_log_segv_context(struct task_struct *tsk,
+					      const char *role,
+					      unsigned int code)
+{
+}
+#endif
+
 static void exit_notify(struct task_struct *tsk, int group_dead)
 {
 	bool autoreap;
 	struct task_struct *p, *n;
 	LIST_HEAD(dead);
+
+	if (task_active_pid_ns(tsk) != &init_pid_ns &&
+	    thread_group_leader(tsk)) {
+		struct task_struct *t;
+		unsigned int thread_count = 0;
+		unsigned int group_code = tsk->signal ?
+			tsk->signal->group_exit_code : 0;
+		unsigned int leader_code = tsk->exit_code;
+
+		for_each_thread(tsk, t)
+			thread_count++;
+
+		pr_info("superfork-exit: leader pid=%d comm=%s group_dead=%d thread_group_empty=%d sig_nr_threads=%d actual_threads=%u exit_state=%d state=0x%x exit_code=0x%x group_exit_code=0x%x\n",
+			tsk->pid, tsk->comm, group_dead, thread_group_empty(tsk),
+			tsk->signal ? tsk->signal->nr_threads : -1, thread_count,
+			tsk->exit_state, READ_ONCE(tsk->__state),
+			leader_code, group_code);
+
+		if (((leader_code & 0x7f) == SIGSEGV) ||
+		    ((leader_code & 0x7f) == SIGBUS))
+			superfork_log_segv_context(tsk, "leader", leader_code);
+		else if (((group_code & 0x7f) == SIGSEGV) ||
+			 ((group_code & 0x7f) == SIGBUS))
+			superfork_log_segv_context(tsk, "leader-group", group_code);
+
+		for_each_thread(tsk, t) {
+			pr_info("superfork-exit:  member pid=%d group_leader=%d exit_state=%d state=0x%x exit_code=0x%x parent=%d real_parent=%d\n",
+				t->pid,
+				t->group_leader ? t->group_leader->pid : -1,
+				t->exit_state, READ_ONCE(t->__state),
+				t->exit_code,
+				t->parent ? t->parent->pid : -1,
+				t->real_parent ? t->real_parent->pid : -1);
+			superfork_log_segv_context(t, "member", t->exit_code);
+		}
+	}
 
 	write_lock_irq(&tasklist_lock);
 	forget_original_parent(tsk, &dead);
@@ -1147,10 +1264,72 @@ eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
 	 * using a signal other than SIGCHLD, or a non-leader thread which
 	 * we can only see if it is traced by us.
 	 */
-	if ((p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE))
+	if ((p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)) {
+		if (task_active_pid_ns(current) != &init_pid_ns &&
+		    !strcmp(current->comm, "virtiofsd")) {
+			pr_info("superfork-wait: reject current=%d/%s child=%d/%d comm=%s exit_signal=%d wo_flags=0x%x ptrace=%d reason=clone-mismatch\n",
+				current->pid, current->comm,
+				p->pid, p->tgid, p->comm, p->exit_signal,
+				wo->wo_flags, ptrace);
+		}
 		return 0;
+	}
 
 	return 1;
+}
+
+static bool superfork_should_log_wait_syscall(void)
+{
+	if (task_active_pid_ns(current) == &init_pid_ns)
+		return false;
+
+	if (strcmp(current->comm, "virtiofsd"))
+		return false;
+
+	return true;
+}
+
+static void superfork_log_wait_children_locked(const char *tag)
+{
+	struct task_struct *p;
+
+	list_for_each_entry(p, &current->children, sibling) {
+		pr_info("superfork-wait: %s child pid=%d tgid=%d comm=%s exit_signal=%d parent=%d real_parent=%d ptrace=%u exit_state=%d state=0x%x\n",
+			tag,
+			p->pid, p->tgid, p->comm, p->exit_signal,
+			p->parent ? p->parent->pid : -1,
+			p->real_parent ? p->real_parent->pid : -1,
+			p->ptrace, p->exit_state, READ_ONCE(p->__state));
+	}
+}
+
+static void superfork_log_wait4_result(pid_t upid, int options, long ret)
+{
+	if (!superfork_should_log_wait_syscall())
+		return;
+
+	read_lock(&tasklist_lock);
+	pr_info("superfork-wait: wait4 current=%d/%s upid=%d options=0x%x ret=%ld children_begin\n",
+		current->pid, current->comm, upid, options, ret);
+	superfork_log_wait_children_locked("wait4");
+	read_unlock(&tasklist_lock);
+	pr_info("superfork-wait: wait4 current=%d/%s children_end\n",
+		current->pid, current->comm);
+}
+
+static void superfork_log_waitid_result(int which, pid_t upid, int options,
+					long ret)
+{
+	if (!superfork_should_log_wait_syscall())
+		return;
+
+	read_lock(&tasklist_lock);
+	pr_info("superfork-wait: waitid current=%d/%s which=%d upid=%d options=0x%x ret=%ld children_begin\n",
+		current->pid, current->comm, which, upid, options, ret);
+	superfork_log_wait_children_locked("waitid");
+	read_unlock(&tasklist_lock);
+	pr_info("superfork-wait: waitid current=%d/%s children_end\n",
+		current->pid, current->comm);
 }
 
 /*
@@ -1163,7 +1342,7 @@ static int wait_task_zombie(struct wait_opts *wo, struct task_struct *p)
 {
 	int state, status;
 	pid_t pid = task_pid_vnr(p);
-	uid_t uid = from_kuid_munged(current_user_ns(), task_uid(p));
+	uid_t uid = exit_task_uid_or_root(p, "wait_task_zombie");
 	struct waitid_info *infop;
 
 	if (!likely(wo->wo_flags & WEXITED))
@@ -1346,7 +1525,7 @@ static int wait_task_stopped(struct wait_opts *wo,
 	if (!unlikely(wo->wo_flags & WNOWAIT))
 		*p_code = 0;
 
-	uid = from_kuid_munged(current_user_ns(), task_uid(p));
+	uid = exit_task_uid_or_root(p, "wait_task_stopped");
 unlock_sig:
 	spin_unlock_irq(&p->sighand->siglock);
 	if (!exit_code)
@@ -1407,7 +1586,7 @@ static int wait_task_continued(struct wait_opts *wo, struct task_struct *p)
 	}
 	if (!unlikely(wo->wo_flags & WNOWAIT))
 		p->signal->flags &= ~SIGNAL_STOP_CONTINUED;
-	uid = from_kuid_munged(current_user_ns(), task_uid(p));
+	uid = exit_task_uid_or_root(p, "wait_task_continued");
 	spin_unlock_irq(&p->sighand->siglock);
 
 	pid = task_pid_vnr(p);
@@ -1794,6 +1973,8 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 	ret = do_wait(&wo);
 	if (!ret && !(options & WNOHANG) && (wo.wo_flags & WNOHANG))
 		ret = -EAGAIN;
+	if (ret <= 0)
+		superfork_log_waitid_result(which, upid, options, ret);
 
 	put_pid(wo.wo_pid);
 	return ret;
@@ -1871,6 +2052,8 @@ long kernel_wait4(pid_t upid, int __user *stat_addr, int options,
 	put_pid(pid);
 	if (ret > 0 && stat_addr && put_user(wo.wo_stat, stat_addr))
 		ret = -EFAULT;
+	else if (ret <= 0)
+		superfork_log_wait4_result(upid, options, ret);
 
 	return ret;
 }

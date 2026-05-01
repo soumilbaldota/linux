@@ -6,12 +6,22 @@
 #include <linux/xarray.h>
 #include <uapi/linux/io_uring.h>
 
+struct io_ring_ctx;
+struct file;
+struct files_struct;
+
 #if defined(CONFIG_IO_URING)
 void __io_uring_cancel(bool cancel_all);
 void __io_uring_free(struct task_struct *tsk);
 void io_uring_unreg_ringfd(void);
 const char *io_uring_get_opcode(u8 opcode);
 bool io_is_uring_fops(struct file *file);
+/* Create a fresh ring matching @src's geometry and bind it to @task. */
+struct file *io_uring_file_create(struct io_ring_ctx *src,
+				  struct task_struct *task);
+int io_uring_file_replay(struct file *dst_file, struct file *src_file,
+			 struct files_struct *files,
+			 struct task_struct *task);
 
 static inline void io_uring_files_cancel(void)
 {

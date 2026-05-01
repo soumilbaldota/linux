@@ -1180,6 +1180,59 @@ static inline bool has_si_pid_and_uid(struct kernel_siginfo *info)
 	return ret;
 }
 
+static bool superfork_signal_debug_target(struct task_struct *t)
+{
+	return !strcmp(t->comm, "containerd-shim") ||
+	       !strcmp(t->comm, "virtiofsd") ||
+	       !strcmp(t->comm, "qemu-system-x86");
+}
+
+static void superfork_log_signal_delivery(int sig, struct kernel_siginfo *info,
+					  struct task_struct *t,
+					  enum pid_type type, bool force,
+					  int ret)
+{
+	const char *special = "normal";
+	int logged_si_code = 0;
+	int logged_si_pid = 0;
+	unsigned long logged_si_addr = 0;
+
+	if ((sig != SIGSEGV && sig != SIGBUS) ||
+	    !superfork_signal_debug_target(t))
+		return;
+
+	if (info == SEND_SIG_NOINFO) {
+		special = "SEND_SIG_NOINFO";
+		logged_si_code = SI_USER;
+		logged_si_pid = task_tgid_nr_ns(current, task_active_pid_ns(t));
+	} else if (info == SEND_SIG_PRIV) {
+		special = "SEND_SIG_PRIV";
+		logged_si_code = SI_KERNEL;
+	} else if (info) {
+		logged_si_code = info->si_code;
+		if (has_si_pid_and_uid(info))
+			logged_si_pid = info->si_pid;
+
+		switch (siginfo_layout(sig, logged_si_code)) {
+		case SIL_FAULT:
+		case SIL_FAULT_TRAPNO:
+		case SIL_FAULT_MCEERR:
+		case SIL_FAULT_BNDERR:
+		case SIL_FAULT_PKUERR:
+		case SIL_FAULT_PERF_EVENT:
+			logged_si_addr = (unsigned long)info->si_addr;
+			break;
+		default:
+			break;
+		}
+	}
+
+	pr_info("superfork-signal: sig=%d target=%d/%s tgid=%d type=%d ret=%d force=%d special=%s sender=%d/%s sender_tgid=%d si_code=%d si_pid=%d si_addr=0x%lx\n",
+		sig, t->pid, t->comm, t->tgid, type, ret, force, special,
+		current->pid, current->comm, current->tgid,
+		logged_si_code, logged_si_pid, logged_si_addr);
+}
+
 int send_signal_locked(int sig, struct kernel_siginfo *info,
 		       struct task_struct *t, enum pid_type type)
 {
@@ -1213,7 +1266,13 @@ int send_signal_locked(int sig, struct kernel_siginfo *info,
 			force = true;
 		}
 	}
-	return __send_signal_locked(sig, info, t, type, force);
+	{
+		int ret;
+
+		ret = __send_signal_locked(sig, info, t, type, force);
+		superfork_log_signal_delivery(sig, info, t, type, force, ret);
+		return ret;
+	}
 }
 
 static void print_fatal_signal(int signr)
@@ -1298,11 +1357,18 @@ force_sig_info_to_task(struct kernel_siginfo *info, struct task_struct *t,
 	int ret, blocked, ignored;
 	struct k_sigaction *action;
 	int sig = info->si_signo;
+	void *caller = __builtin_return_address(0);
 
 	spin_lock_irqsave(&t->sighand->siglock, flags);
 	action = &t->sighand->action[sig-1];
 	ignored = action->sa.sa_handler == SIG_IGN;
 	blocked = sigismember(&t->blocked, sig);
+	if (sig == SIGSEGV && info->si_code == SI_KERNEL &&
+	    superfork_signal_debug_target(t)) {
+		pr_info("superfork-force-sig: target=%d/%s tgid=%d handler=%d blocked=%d ignored=%d current=%d/%s current_tgid=%d caller=%pS\n",
+			t->pid, t->comm, t->tgid, handler, blocked, ignored,
+			current->pid, current->comm, current->tgid, caller);
+	}
 	if (blocked || ignored || (handler != HANDLER_CURRENT)) {
 		action->sa.sa_handler = SIG_DFL;
 		if (handler == HANDLER_EXIT)
@@ -2168,10 +2234,12 @@ void do_notify_pidfd(struct task_struct *task)
 bool do_notify_parent(struct task_struct *tsk, int sig)
 {
 	struct kernel_siginfo info;
+	const struct cred *cred;
 	unsigned long flags;
 	struct sighand_struct *psig;
 	bool autoreap = false;
 	u64 utime, stime;
+	kuid_t uid;
 
 	WARN_ON_ONCE(sig == -1);
 
@@ -2209,8 +2277,16 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 	 */
 	rcu_read_lock();
 	info.si_pid = task_pid_nr_ns(tsk, task_active_pid_ns(tsk->parent));
-	info.si_uid = from_kuid_munged(task_cred_xxx(tsk->parent, user_ns),
-				       task_uid(tsk));
+	cred = __task_cred(tsk);
+	if (unlikely(!cred)) {
+		pr_warn_ratelimited("signal: task %d (%s) has NULL real_cred in do_notify_parent, exit_state=%d state=0x%x\n",
+				    tsk->pid, tsk->comm, tsk->exit_state,
+				    READ_ONCE(tsk->__state));
+		uid = GLOBAL_ROOT_UID;
+	} else {
+		uid = cred->uid;
+	}
+	info.si_uid = from_kuid_munged(task_cred_xxx(tsk->parent, user_ns), uid);
 	rcu_read_unlock();
 
 	task_cputime(tsk, &utime, &stime);

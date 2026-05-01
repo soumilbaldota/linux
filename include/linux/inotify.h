@@ -17,4 +17,9 @@
 			  IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | \
 			  IN_MASK_CREATE | IN_ISDIR | IN_ONESHOT)
 
+#ifdef CONFIG_INOTIFY_USER
+/* Create a new, empty inotify file (no fd installed). Used by superfork. */
+struct file *inotify_file_create(int flags);
+#endif
+
 #endif	/* _LINUX_INOTIFY_H */

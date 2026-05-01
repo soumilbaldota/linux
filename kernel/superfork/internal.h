@@ -17,6 +17,11 @@ static inline struct task_clone_entry *get_ctx_task(struct container_clone_ctx *
 	return &ctx->tasks[i];
 }
 
+static inline struct sf_ns_domain *get_ctx_domain(struct container_clone_ctx *ctx, int i)
+{
+	return &ctx->domains[i];
+}
+
 /*
  * Per-leader record used while migrating source tasks into src_cgrp before
  * freezing and restoring them afterward.
@@ -51,18 +56,35 @@ void release_collected_tasks(struct container_clone_ctx *ctx);
 
 struct tgid_clone_entry *find_or_create_tgid_entry(struct container_clone_ctx *ctx,
 						    pid_t old_tgid);
+int  superfork_domain_lookup_path(const struct sf_ns_domain *domain,
+				      const char *path_name,
+				      unsigned int lookup_flags,
+				      struct path *path);
+struct file *superfork_domain_open_path(const struct sf_ns_domain *domain,
+					     const char *path_name,
+					     int open_flags,
+					     umode_t mode);
 
 /* ---- fd.c -------------------------------------------------------------- */
 
 struct files_struct *superfork_dup_files_for_container(
+	struct container_clone_ctx *ctx,
 	struct files_struct *oldf,
-	const char *src_bundle_path,
-	const char *dst_bundle_path,
+	const struct container_config *config,
+	const struct sf_ns_domain *domain,
+	struct task_struct *owner_task,
 	struct mm_struct *new_mm,
 	struct tgid_clone_entry *tgid_entry);
 int  superfork_verify_cloned_fds(struct container_clone_ctx *ctx);
 int  superfork_replace_file_at(struct files_struct *files, unsigned int fd,
 			       struct file *replacement);
+int  superfork_reopen_procfs_fds(struct container_clone_ctx *ctx);
+int  superfork_reopen_pidfds(struct container_clone_ctx *ctx);
+int  superfork_prepare_internal_unix_edges(struct container_clone_ctx *ctx);
+int  superfork_prepare_internal_pipe_edges(struct container_clone_ctx *ctx);
+void superfork_release_internal_pipe_edges(struct container_clone_ctx *ctx);
+void superfork_release_internal_unix_edges(struct container_clone_ctx *ctx);
+void superfork_release_allowed_shared_files(struct container_clone_ctx *ctx);
 
 /* ---- kvm.c ------------------------------------------------------------- */
 
@@ -77,7 +99,7 @@ int superfork_clone_kvm_vcpu_fd(struct files_struct *files, unsigned int fd,
 
 /* ---- attach.c ---------------------------------------------------------- */
 
-void superfork_attach_tasks(struct container_clone_ctx *ctx);
+int  superfork_attach_tasks(struct container_clone_ctx *ctx);
 void superfork_post_fork(struct container_clone_ctx *ctx);
 int  superfork_seed_cgroup_membership(struct container_clone_ctx *ctx);
 void superfork_wake_tasks(struct container_clone_ctx *ctx);

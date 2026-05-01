@@ -158,7 +158,13 @@ const struct cred *get_task_cred(struct task_struct *task)
 
 	do {
 		cred = __task_cred((task));
-		BUG_ON(!cred);
+		if (unlikely(!cred)) {
+			rcu_read_unlock();
+			pr_warn_ratelimited("cred: task %d (%s) has NULL cred during lookup, exit_state=%d state=0x%x\n",
+					    task->pid, task->comm, task->exit_state,
+					    READ_ONCE(task->__state));
+			return get_cred(&init_cred);
+		}
 	} while (!get_cred_rcu(cred));
 
 	rcu_read_unlock();

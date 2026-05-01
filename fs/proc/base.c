@@ -1888,11 +1888,30 @@ void task_dump_owner(struct task_struct *task, umode_t mode,
 		return;
 	}
 
+	if (unlikely(proc_task_exited_dead(task))) {
+		*ruid = GLOBAL_ROOT_UID;
+		*rgid = GLOBAL_ROOT_GID;
+		return;
+	}
+
 	/* Default to the tasks effective ownership */
 	rcu_read_lock();
 	cred = __task_cred(task);
-	uid = cred->euid;
-	gid = cred->egid;
+	if (unlikely(!cred)) {
+		/*
+		 * Exiting tasks clear task->{cred,real_cred} before they fully
+		 * disappear from proc-visible lifetime.  Proc ownership queries
+		 * must tolerate that window instead of dereferencing NULL.
+		 */
+		pr_warn_ratelimited("proc: task %d (%s) has NULL cred during proc ownership lookup, exit_state=%d state=0x%x\n",
+				    task->pid, task->comm, task->exit_state,
+				    READ_ONCE(task->__state));
+		uid = GLOBAL_ROOT_UID;
+		gid = GLOBAL_ROOT_GID;
+	} else {
+		uid = cred->euid;
+		gid = cred->egid;
+	}
 	rcu_read_unlock();
 
 	/*
@@ -2026,20 +2045,21 @@ int pid_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 	stat->uid = GLOBAL_ROOT_UID;
 	stat->gid = GLOBAL_ROOT_GID;
-	rcu_read_lock();
-	task = pid_task(proc_pid(inode), PIDTYPE_PID);
-	if (task) {
-		if (!has_pid_permissions(fs_info, task, HIDEPID_INVISIBLE)) {
-			rcu_read_unlock();
-			/*
-			 * This doesn't prevent learning whether PID exists,
-			 * it only makes getattr() consistent with readdir().
-			 */
-			return -ENOENT;
-		}
-		task_dump_owner(task, inode->i_mode, &stat->uid, &stat->gid);
+	task = get_proc_task(inode);
+	if (!task)
+		return 0;
+
+	if (!has_pid_permissions(fs_info, task, HIDEPID_INVISIBLE)) {
+		put_task_struct(task);
+		/*
+		 * This doesn't prevent learning whether PID exists,
+		 * it only makes getattr() consistent with readdir().
+		 */
+		return -ENOENT;
 	}
-	rcu_read_unlock();
+
+	task_dump_owner(task, inode->i_mode, &stat->uid, &stat->gid);
+	put_task_struct(task);
 	return 0;
 }
 
@@ -2068,18 +2088,19 @@ static int pid_revalidate(struct inode *dir, const struct qstr *name,
 	struct task_struct *task;
 	int ret = 0;
 
-	rcu_read_lock();
-	inode = d_inode_rcu(dentry);
-	if (!inode)
-		goto out;
-	task = pid_task(proc_pid(inode), PIDTYPE_PID);
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
 
+	inode = d_inode(dentry);
+	if (!inode)
+		return 0;
+
+	task = get_proc_task(inode);
 	if (task) {
 		pid_update_inode(task, inode);
+		put_task_struct(task);
 		ret = 1;
 	}
-out:
-	rcu_read_unlock();
 	return ret;
 }
 
@@ -3490,6 +3511,9 @@ static struct dentry *proc_pid_instantiate(struct dentry * dentry,
 {
 	struct inode *inode;
 
+	if (unlikely(proc_task_exited_dead(task)))
+		return ERR_PTR(-ENOENT);
+
 	inode = proc_pid_make_base_inode(dentry->d_sb, task,
 					 S_IFDIR | S_IRUGO | S_IXUGO);
 	if (!inode)
@@ -3526,6 +3550,12 @@ struct dentry *proc_pid_lookup(struct dentry *dentry, unsigned int flags)
 	rcu_read_unlock();
 	if (!task)
 		goto out;
+
+	if (unlikely(proc_task_exited_dead(task))) {
+		put_task_struct(task);
+		task = NULL;
+		goto out;
+	}
 
 	/* Limit procfs to only ptraceable tasks */
 	if (fs_info->hide_pid == HIDEPID_NOT_PTRACEABLE) {

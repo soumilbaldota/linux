@@ -14679,7 +14679,19 @@ int kvm_arch_superfork_prepare_vm(struct kvm *dst, struct kvm *src)
 	}
 
 #ifdef CONFIG_KVM_IOAPIC
-	/* In-kernel IRQCHIP (PIC + IOAPIC). QEMU's default. */
+	/*
+	 * Mirror src's irqchip mode on dst. irqchip_in_kernel() is true for
+	 * both KVM_IRQCHIP_KERNEL (full in-kernel PIC+IOAPIC, QEMU's
+	 * kernel-irqchip=on) and KVM_IRQCHIP_SPLIT (LAPIC in kernel, IOAPIC
+	 * in userspace, Kata QEMU's kernel-irqchip=split). The two modes need
+	 * different setup on dst: full mode creates the PIC + IOAPIC and
+	 * default routing, split mode just sets the mode flag and reserved
+	 * IOAPIC pin count.
+	 *
+	 * Without this distinction, a split-mode src ended up cloned into a
+	 * full-mode dst, and superfork_restore_vm_io's kvm_set_irq_routing
+	 * call rejected QEMU's userspace-IOAPIC routing entries with -EINVAL.
+	 */
 	if (irqchip_in_kernel(src) && !irqchip_in_kernel(dst)) {
 		mutex_lock(&dst->lock);
 
@@ -14689,31 +14701,40 @@ int kvm_arch_superfork_prepare_vm(struct kvm *dst, struct kvm *src)
 			return -EINVAL;
 		}
 
-		ret = kvm_pic_init(dst);
-		if (ret) {
+		if (irqchip_split(src)) {
+			smp_wmb();
+			dst->arch.irqchip_mode = KVM_IRQCHIP_SPLIT;
+			dst->arch.nr_reserved_ioapic_pins =
+				src->arch.nr_reserved_ioapic_pins;
+			kvm_clear_apicv_inhibit(dst, APICV_INHIBIT_REASON_ABSENT);
 			mutex_unlock(&dst->lock);
-			return ret;
-		}
+		} else {
+			ret = kvm_pic_init(dst);
+			if (ret) {
+				mutex_unlock(&dst->lock);
+				return ret;
+			}
 
-		ret = kvm_ioapic_init(dst);
-		if (ret) {
-			kvm_pic_destroy(dst);
+			ret = kvm_ioapic_init(dst);
+			if (ret) {
+				kvm_pic_destroy(dst);
+				mutex_unlock(&dst->lock);
+				return ret;
+			}
+
+			ret = kvm_setup_default_ioapic_and_pic_routing(dst);
+			if (ret) {
+				kvm_ioapic_destroy(dst);
+				kvm_pic_destroy(dst);
+				mutex_unlock(&dst->lock);
+				return ret;
+			}
+
+			smp_wmb();
+			dst->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
+			kvm_clear_apicv_inhibit(dst, APICV_INHIBIT_REASON_ABSENT);
 			mutex_unlock(&dst->lock);
-			return ret;
 		}
-
-		ret = kvm_setup_default_ioapic_and_pic_routing(dst);
-		if (ret) {
-			kvm_ioapic_destroy(dst);
-			kvm_pic_destroy(dst);
-			mutex_unlock(&dst->lock);
-			return ret;
-		}
-
-		smp_wmb();
-		dst->arch.irqchip_mode = KVM_IRQCHIP_KERNEL;
-		kvm_clear_apicv_inhibit(dst, APICV_INHIBIT_REASON_ABSENT);
-		mutex_unlock(&dst->lock);
 	}
 
 	/* In-kernel PIT (i8254). */
@@ -14750,7 +14771,13 @@ int kvm_arch_superfork_finalize_vm(struct kvm *dst, struct kvm *src)
 		return -EINVAL;
 
 #ifdef CONFIG_KVM_IOAPIC
-	if (irqchip_in_kernel(src) && irqchip_in_kernel(dst)) {
+	/*
+	 * KVM_GET_IRQCHIP / KVM_SET_IRQCHIP only operate on the full in-kernel
+	 * PIC + IOAPIC. Split irqchip keeps the IOAPIC in userspace, so QEMU
+	 * is the source of truth for that chip state and there is nothing for
+	 * us to copy here.
+	 */
+	if (irqchip_full(src) && irqchip_full(dst)) {
 		chip = kzalloc(sizeof(*chip), GFP_KERNEL);
 		if (!chip)
 			return -ENOMEM;

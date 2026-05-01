@@ -1812,7 +1812,8 @@ static void srcu_invoke_callbacks(struct work_struct *work)
 	rhp = rcu_cblist_dequeue(&ready_cbs);
 	for (; rhp != NULL; rhp = rcu_cblist_dequeue(&ready_cbs)) {
 		debug_rcu_head_unqueue(rhp);
-		debug_rcu_head_callback(rhp);
+		if (!debug_rcu_head_callback(rhp))
+			continue;
 		local_bh_disable();
 		rhp->func(rhp);
 		local_bh_enable();

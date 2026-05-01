@@ -8,9 +8,11 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/major.h>
 #include <linux/sched/signal.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/signal.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
@@ -2210,6 +2212,145 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
 	return do_epoll_create(flags);
 }
+
+/**
+ * epoll_file_create - allocate a new epoll file without installing an fd
+ * @flags: O_CLOEXEC and/or O_NONBLOCK
+ *
+ * Returns a struct file * with one reference held by the caller, or an
+ * ERR_PTR on failure.  Used by superfork to give each cloned task a fresh,
+ * empty epoll instance in place of the source's epoll fd.
+ */
+struct file *epoll_file_create(int flags)
+{
+	struct eventpoll *ep;
+	struct file *file;
+	int error;
+
+	error = ep_alloc(&ep);
+	if (error < 0)
+		return ERR_PTR(error);
+
+	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep,
+				  O_RDWR | (flags & O_CLOEXEC));
+	if (IS_ERR(file))
+		ep_clear_and_put(ep);
+	else
+		ep->file = file;
+
+	return file;
+}
+EXPORT_SYMBOL_GPL(epoll_file_create);
+
+static struct file *epoll_get_file_at(struct files_struct *files, unsigned int fd)
+{
+	struct fdtable *fdt;
+	struct file *file = NULL;
+
+	spin_lock(&files->file_lock);
+	fdt = files_fdtable(files);
+	if (fd < fdt->max_fds && test_bit(fd, fdt->open_fds)) {
+		file = rcu_dereference_raw(fdt->fd[fd]);
+		if (file)
+			get_file(file);
+	}
+	spin_unlock(&files->file_lock);
+
+	return file;
+}
+
+static unsigned int epoll_watch_count(struct eventpoll *ep)
+{
+	struct rb_node *rbp;
+	unsigned int count = 0;
+
+	for (rbp = rb_first_cached(&ep->rbr); rbp; rbp = rb_next(rbp))
+		count++;
+
+	return count;
+}
+
+static bool epoll_is_superfork_dead_placeholder(struct file *file)
+{
+	struct inode *inode;
+
+	if (!file)
+		return false;
+
+	inode = file_inode(file);
+	if (!inode || !S_ISCHR(inode->i_mode))
+		return false;
+
+	return imajor(inode) == MEM_MAJOR && iminor(inode) == 3;
+}
+
+int epoll_file_replay(struct file *dst_file, struct file *src_file,
+		      struct files_struct *files)
+{
+	struct eventpoll *src_ep;
+	struct eventpoll *dst_ep;
+	struct rb_node *rbp;
+	int error = 0;
+	unsigned int skipped = 0;
+
+	if (!dst_file || !src_file || !files)
+		return -EINVAL;
+	if (!is_file_epoll(dst_file) || !is_file_epoll(src_file))
+		return -EINVAL;
+
+	src_ep = src_file->private_data;
+	dst_ep = dst_file->private_data;
+
+	mutex_lock(&src_ep->mtx);
+	mutex_lock(&dst_ep->mtx);
+	for (rbp = rb_first_cached(&src_ep->rbr); rbp; rbp = rb_next(rbp)) {
+		struct epitem *epi = rb_entry(rbp, struct epitem, rbn);
+		struct file *tfile;
+
+		tfile = epoll_get_file_at(files, epi->ffd.fd);
+		if (!tfile) {
+			error = -EBADF;
+			break;
+		}
+
+		if (is_file_epoll(tfile)) {
+			fput(tfile);
+			error = -EOPNOTSUPP;
+			break;
+		}
+
+		if (!file_can_poll(tfile) ||
+		    epoll_is_superfork_dead_placeholder(tfile)) {
+			/*
+			 * The replacement for this fd is a dead placeholder
+			 * (most commonly /dev/null standing in for an external
+			 * socket/pipe) or otherwise not pollable. Drop the
+			 * watch entry: wiring epoll to placeholders creates
+			 * fake readiness and can spin the clone's event loop.
+			 */
+			pr_debug("superfork epoll replay: fd %u replacement is a dead placeholder, skipping watch\n",
+				 epi->ffd.fd);
+			fput(tfile);
+			skipped++;
+			continue;
+		}
+
+		if (!ep_find(dst_ep, tfile, epi->ffd.fd))
+			error = ep_insert(dst_ep, &epi->event, tfile,
+					  epi->ffd.fd, 0);
+		fput(tfile);
+		if (error < 0)
+			break;
+	}
+
+	if (!error && epoll_watch_count(dst_ep) + skipped != epoll_watch_count(src_ep))
+		error = -EUCLEAN;
+	mutex_unlock(&dst_ep->mtx);
+	mutex_unlock(&src_ep->mtx);
+
+	return error;
+}
+EXPORT_SYMBOL_GPL(epoll_file_replay);
 
 SYSCALL_DEFINE1(epoll_create, int, size)
 {

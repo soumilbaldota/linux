@@ -10,6 +10,8 @@
 #include <linux/btrfs.h>
 #include <asm/ptrace.h>
 
+#define SF_MAX_BUNDLES         16
+
 struct task_struct;
 struct signal_struct;
 struct sighand_struct;
@@ -19,6 +21,8 @@ struct fs_struct;
 struct file;
 struct kvm;
 struct kvm_vcpu;
+struct sf_pipe_edge;
+struct sf_unix_sock_edge;
 
 /*
  * Snapshot of a vCPU thread's userspace pt_regs, captured at the moment KVM
@@ -67,25 +71,91 @@ extern struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid, size_t se
 extern struct kmem_cache *sighand_cachep;
 
 /*
- * Container configuration for superfork.
+ * Userspace-visible syscall payload. Pointer fields store userspace addresses.
+ *
+ * The bundle interface is intentionally split into:
+ *   - one root bundle
+ *   - zero or more auxiliary bundles
+ *
+ * The root bundle is the primary cloned snapshot root. Auxiliary bundles may
+ * contribute additional mount-visible paths for helper daemons that do not run
+ * with the primary bundle as their effective fs root.
+ *
+ * Auxiliary bundles are additional snapshot/remap roots that belong to the
+ * same logical container but are not themselves the cloned process root. This
+ * matches runtimes like Kata, where sandbox state is spread across multiple
+ * directories and only one of them should become the clone's rootfs.
  */
+struct container_config_user {
+	char src_cgroup_path[256];
+	char root_src_bundle_path[4096];
+	char root_dst_bundle_path[4096];
+	__u32 aux_bundle_count;
+	__u32 reserved;
+	__u64 aux_src_bundle_paths_ptr;
+	__u64 aux_dst_bundle_paths_ptr;
+	struct btrfs_ioctl_vol_args_v2 btrfs_args;
+};
+
 struct container_config {
 	char src_cgroup_path[256];
-	char src_bundle_path[4096];
-	char dst_bundle_path[4096];
-	struct btrfs_ioctl_vol_args_v2 btrfs_args; /* pre-filled by userspace */
+	char root_src_bundle_path[4096];
+	char root_dst_bundle_path[4096];
+	__u32 aux_bundle_count;
+	char aux_src_bundle_paths[SF_MAX_BUNDLES][4096];
+	char aux_dst_bundle_paths[SF_MAX_BUNDLES][4096];
+	struct btrfs_ioctl_vol_args_v2 btrfs_args;
 };
 
 #define MAX_CLONE_TASKS         256
 #define MAX_CLONE_TGIDS         64
 #define SF_MAX_KVM_VMS_PER_PROC 8
 #define SF_MAX_KVM_VCPUS_PER_VM 512
+#define SF_MAX_PROCFS_REOPENS   32
+#define SF_MAX_PIDFD_REOPENS    32
+
+/*
+ * Records a single procfs fd that needs to be reopened after
+ * superfork_attach_tasks gives the clone stable PIDs.
+ *
+ * If old_pid > 0, the file is pid-scoped and relpath stores everything after
+ * /proc/<old_pid>/ so it can be rebuilt as /proc/<new_pid>/<relpath>.
+ *
+ * If old_pid == 0, the file is procfs-global and relpath stores the path
+ * relative to the procfs root without the leading slash; the empty string
+ * denotes the procfs root itself and reopens as /proc.
+ *
+ * Until reopen, the fd slot holds /dev/null as a placeholder.
+ */
+struct sf_procfs_reopen {
+	unsigned int fd;
+	pid_t        old_pid;
+	int          open_flags;
+	loff_t       pos;
+	char         relpath[256];
+};
+
+struct sf_pidfd_reopen {
+	unsigned int fd;
+	pid_t        old_pid;
+	unsigned int flags;
+};
+
+struct sf_ns_domain {
+	struct task_struct *src_task;
+	struct nsproxy *src_nsproxy;
+	struct nsproxy *new_nsproxy;
+};
 
 struct task_clone_entry {
 	struct task_struct *old_task;
 	struct task_struct *new_task;
 	pid_t old_tgid;
+	unsigned int domain_id;
 	bool is_leader;
+	bool attached;
+	char src_root_path[4096];
+	char src_pwd_path[4096];
 };
 
 struct sf_kvm_vcpu_map {
@@ -109,23 +179,40 @@ struct tgid_clone_entry {
 	struct signal_struct *shared_signal;
 	struct sighand_struct *shared_sighand;
 	struct files_struct *shared_files;
+	struct fs_struct *shared_fs;
 	/* KVM fd replacement map is keyed per leader because files/mm are leader-shared. */
 	struct sf_kvm_vm_map kvm_vms[SF_MAX_KVM_VMS_PER_PROC];
 	int kvm_vm_count;
+	/* procfs fds to reopen post-attach once the clone has a stable PID. */
+	struct sf_procfs_reopen procfs_reopens[SF_MAX_PROCFS_REOPENS];
+	int procfs_reopen_count;
+	/* pidfds to retarget to cloned tasks post-attach. */
+	struct sf_pidfd_reopen pidfd_reopens[SF_MAX_PIDFD_REOPENS];
+	int pidfd_reopen_count;
 };
 
 struct container_clone_ctx {
 	struct pid_namespace *src_pid_ns;
-	struct nsproxy *src_nsproxy;
-
 	struct pid_namespace *new_pid_ns;
-	struct nsproxy *new_nsproxy;
+
+	struct sf_ns_domain domains[MAX_CLONE_TASKS];
+	int domain_count;
+	struct sf_unix_sock_edge *unix_sock_edges;
+	unsigned int unix_sock_edge_count;
+	unsigned int unix_sock_edge_capacity;
+	struct sf_pipe_edge *pipe_edges;
+	unsigned int pipe_edge_count;
+	unsigned int pipe_edge_capacity;
+	struct file **allowed_shared_files;
+	unsigned int allowed_shared_file_count;
+	unsigned int allowed_shared_file_capacity;
 
 	struct task_clone_entry tasks[MAX_CLONE_TASKS];
 	int task_count;
 
 	struct tgid_clone_entry tgids[MAX_CLONE_TGIDS];
 	int tgid_count;
+	bool post_fork_done;
 };
 
 #define for_each_task_in_ctx(ctx) \
@@ -134,11 +221,12 @@ struct container_clone_ctx {
 /* From process.c - called by superfork_clone_processes */
 struct task_struct *superfork_copy_process(
 	struct container_clone_ctx *ctx,
-	struct task_struct *src_task,
+	struct task_clone_entry *task_entry,
 	struct tgid_clone_entry *tgid_entry,
-	const char *src_bundle_path,
-	const char *dst_bundle_path,
+	const struct container_config *config,
 	bool is_leader);
+
+void superfork_release_placeholder_peers(struct task_struct *task);
 
 #ifdef CONFIG_TASK_XACCT
 void acct_clear_integrals(struct task_struct *tsk);

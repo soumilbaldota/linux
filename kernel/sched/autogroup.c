@@ -215,6 +215,12 @@ void sched_autogroup_fork(struct signal_struct *sig)
 	sig->autogroup = autogroup_task_get(current);
 }
 
+void sched_autogroup_fork_from_task(struct signal_struct *sig,
+				    struct task_struct *p)
+{
+	sig->autogroup = autogroup_task_get(p);
+}
+
 void sched_autogroup_exit(struct signal_struct *sig)
 {
 	autogroup_kref_put(sig->autogroup);
