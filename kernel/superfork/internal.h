@@ -108,6 +108,13 @@ struct file *superfork_domain_open_path(const struct sf_ns_domain *domain,
 					     const char *path_name,
 					     int open_flags,
 					     umode_t mode);
+int  superfork_switch_current_to_domain_mntns(const struct sf_ns_domain *domain,
+					      struct nsproxy **saved_nsproxy,
+					      struct path *saved_root,
+					      struct path *saved_pwd);
+void superfork_restore_current_mntns(struct nsproxy *saved_nsproxy,
+				     struct path *saved_root,
+				     struct path *saved_pwd);
 
 /* ---- fd.c -------------------------------------------------------------- */
 

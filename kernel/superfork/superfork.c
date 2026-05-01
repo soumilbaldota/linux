@@ -242,10 +242,10 @@ static char *superfork_derive_sbs_runtime_path(const char *bundle_path)
 	return kasprintf(GFP_KERNEL, "/run/vc/sbs/%s", sandbox);
 }
 
-static int superfork_switch_current_to_domain_mntns(const struct sf_ns_domain *domain,
-						    struct nsproxy **saved_nsproxy,
-						    struct path *saved_root,
-						    struct path *saved_pwd)
+int superfork_switch_current_to_domain_mntns(const struct sf_ns_domain *domain,
+					     struct nsproxy **saved_nsproxy,
+					     struct path *saved_root,
+					     struct path *saved_pwd)
 {
 	struct mnt_namespace *mnt_ns;
 	struct path new_root;
@@ -284,9 +284,9 @@ out_put_saved_ns:
 	return ret;
 }
 
-static void superfork_restore_current_mntns(struct nsproxy *saved_nsproxy,
-					    struct path *saved_root,
-					    struct path *saved_pwd)
+void superfork_restore_current_mntns(struct nsproxy *saved_nsproxy,
+				     struct path *saved_root,
+				     struct path *saved_pwd)
 {
 	if (!saved_nsproxy)
 		return;

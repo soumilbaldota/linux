@@ -261,6 +261,72 @@ struct fd_action {
 
 static bool superfork_pipe_endpoint_is_orphaned(struct file *src_file);
 
+#define SF_FD_PAIR_STATUS_FLAGS (O_NONBLOCK | O_DIRECT)
+
+struct sf_fd_endpoint_attrs {
+	fmode_t f_mode;
+	unsigned int f_flags;
+	int sock_type;
+};
+
+static void superfork_capture_fd_endpoint_attrs(struct file *file,
+						struct sf_fd_endpoint_attrs *attrs)
+{
+	struct socket *sock;
+
+	memset(attrs, 0, sizeof(*attrs));
+	if (!file)
+		return;
+
+	attrs->f_mode = file->f_mode;
+	attrs->f_flags = file->f_flags & SF_FD_PAIR_STATUS_FLAGS;
+
+	sock = sock_from_file(file);
+	if (sock)
+		attrs->sock_type = sock->type;
+}
+
+static void superfork_apply_fd_endpoint_attrs(struct file *file,
+					      const struct sf_fd_endpoint_attrs *attrs,
+					      unsigned int flags_mask)
+{
+	if (!file || !attrs || !flags_mask)
+		return;
+
+	spin_lock(&file->f_lock);
+	file->f_flags = (file->f_flags & ~flags_mask) |
+			(attrs->f_flags & flags_mask);
+	spin_unlock(&file->f_lock);
+}
+
+static bool superfork_fd_endpoint_flags_match(
+				const struct file *file,
+				const struct sf_fd_endpoint_attrs *attrs,
+				unsigned int flags_mask)
+{
+	if (!file || !attrs)
+		return false;
+
+	return (file->f_flags & flags_mask) == (attrs->f_flags & flags_mask);
+}
+
+static int superfork_pipe_slot_for_endpoint(
+				const struct sf_fd_endpoint_attrs *attrs)
+{
+	bool is_read;
+	bool is_write;
+
+	if (!attrs)
+		return -EINVAL;
+
+	is_read = !!(attrs->f_mode & FMODE_READ);
+	is_write = !!(attrs->f_mode & FMODE_WRITE);
+	if (is_read == is_write)
+		return -EINVAL;
+
+	return is_read ? 0 : 1;
+}
+
 static bool superfork_owner_uses_external_unix_placeholders(
 				const struct task_struct *owner_task)
 {
@@ -329,6 +395,7 @@ static int superfork_share_source_file(struct container_clone_ctx *ctx,
 struct sf_unix_sock_edge {
 	struct file *src_file[2];
 	struct file *new_file[2];
+	struct sf_fd_endpoint_attrs attrs[2];
 	pid_t src_tgid[2];
 	unsigned int src_fd[2];
 };
@@ -336,6 +403,7 @@ struct sf_unix_sock_edge {
 struct sf_pipe_edge {
 	struct file *src_file[2];
 	struct file *new_file[2];
+	struct sf_fd_endpoint_attrs attrs[2];
 };
 
 static bool superfork_is_kvm_vm_file(struct file *file)
@@ -769,14 +837,18 @@ static int superfork_add_internal_unix_edge(
 	edge = &ctx->unix_sock_edges[ctx->unix_sock_edge_count++];
 	edge->src_file[0] = get_file(src_a->file);
 	edge->src_file[1] = get_file(src_b->file);
+	superfork_capture_fd_endpoint_attrs(edge->src_file[0], &edge->attrs[0]);
+	superfork_capture_fd_endpoint_attrs(edge->src_file[1], &edge->attrs[1]);
 	edge->src_tgid[0] = src_a->owner_tgid;
 	edge->src_tgid[1] = src_b->owner_tgid;
 	edge->src_fd[0] = src_a->fd;
 	edge->src_fd[1] = src_b->fd;
-	pr_info("superfork: internal unix edge add idx=%u left=%d fd=%u file=%p right=%d fd=%u file=%p\n",
+	pr_info("superfork: internal unix edge add idx=%u left=%d fd=%u file=%p flags=0x%x right=%d fd=%u file=%p flags=0x%x type=%d\n",
 		ctx->unix_sock_edge_count - 1,
 		edge->src_tgid[0], edge->src_fd[0], edge->src_file[0],
-		edge->src_tgid[1], edge->src_fd[1], edge->src_file[1]);
+		edge->attrs[0].f_flags,
+		edge->src_tgid[1], edge->src_fd[1], edge->src_file[1],
+		edge->attrs[1].f_flags, edge->attrs[0].sock_type);
 	return 0;
 }
 
@@ -1031,6 +1103,8 @@ static int superfork_add_internal_pipe_edge(struct container_clone_ctx *ctx,
 	edge = &ctx->pipe_edges[ctx->pipe_edge_count++];
 	edge->src_file[0] = get_file(reader);
 	edge->src_file[1] = get_file(writer);
+	superfork_capture_fd_endpoint_attrs(edge->src_file[0], &edge->attrs[0]);
+	superfork_capture_fd_endpoint_attrs(edge->src_file[1], &edge->attrs[1]);
 	return 0;
 }
 
@@ -1381,8 +1455,29 @@ static char *superfork_remap_live_run_path(const char *src_path,
 	return kasprintf(GFP_KERNEL, "%s%s", best_dst_run, suffix);
 }
 
-static char *superfork_short_run_socket_path(const char *src_path,
-					     const struct container_config *config)
+static char *superfork_fd_derive_sbs_runtime_path(const char *bundle_path)
+{
+	static const char marker[] = "/run/vc/vm/";
+	const char *vm;
+	const char *sandbox;
+
+	if (!bundle_path)
+		return NULL;
+
+	vm = strstr(bundle_path, marker);
+	if (!vm)
+		return NULL;
+
+	sandbox = vm + strlen(marker);
+	if (!sandbox[0])
+		return NULL;
+
+	return kasprintf(GFP_KERNEL, "/run/vc/sbs/%s", sandbox);
+}
+
+static char *superfork_short_external_unix_listener_path(
+				const char *src_path,
+				const struct container_config *config)
 {
 	const char *root;
 	const char *run;
@@ -1412,10 +1507,6 @@ static char *superfork_short_run_socket_path(const char *src_path,
 	if (!tag_len)
 		return NULL;
 
-	/*
-	 * Keep the synthesized runtime socket path under UNIX_PATH_MAX even
-	 * when the original basename is a 64-byte containerd socket ID.
-	 */
 	tag_len = min(tag_len, (size_t)24);
 
 	base = strrchr(src_path, '/');
@@ -1423,6 +1514,104 @@ static char *superfork_short_run_socket_path(const char *src_path,
 
 	return kasprintf(GFP_KERNEL, "/run/sf-%.*s-%s",
 			 (int)tag_len, tag, base);
+}
+
+static bool superfork_unix_listener_path_is_clone_runtime(
+				const char *src_path,
+				const struct container_config *config,
+				unsigned int idx)
+{
+	const char *src_root = superfork_bundle_src_path(config, idx);
+	const char *src_run;
+	char *src_sbs;
+	bool matched = false;
+
+	if (!src_path || !src_root || !src_root[0])
+		return false;
+
+	src_run = superfork_find_run_component(src_root);
+	if (src_run && superfork_path_matches_root_prefix(src_path, src_run))
+		return true;
+
+	src_sbs = superfork_fd_derive_sbs_runtime_path(src_root);
+	if (src_sbs) {
+		matched = superfork_path_matches_root_prefix(src_path, src_sbs);
+		kfree(src_sbs);
+	}
+
+	return matched;
+}
+
+static char *superfork_remap_unix_listener_bind_path(
+				const char *src_path,
+				const struct container_config *config,
+				bool *clone_owned)
+{
+	const char *best_dst = NULL, *suffix;
+	size_t best_src_len = 0, dst_len;
+	bool dst_has_slash, suffix_has_slash;
+	unsigned int i;
+
+	if (!src_path || !config)
+		return NULL;
+	if (clone_owned)
+		*clone_owned = false;
+
+	for (i = 0; i < superfork_bundle_count(config); i++) {
+		const char *src_bundle_path = superfork_bundle_src_path(config, i);
+		const char *dst_bundle_path = superfork_bundle_dst_path(config, i);
+		size_t src_len;
+
+		if (!src_bundle_path || !src_bundle_path[0] ||
+		    !dst_bundle_path || !dst_bundle_path[0])
+			continue;
+
+		if (superfork_path_matches_root_prefix(src_path, src_bundle_path)) {
+			src_len = strlen(src_bundle_path);
+			if (src_len >= best_src_len) {
+				best_dst = dst_bundle_path;
+				best_src_len = src_len;
+			}
+			continue;
+		}
+
+		/*
+		 * Runtime sockets such as /run/vc/vm/<sid>/qmp.sock and
+		 * /run/vc/sbs/<sid>/shim-monitor.sock should be rebound by
+		 * their source-visible name after switching to the cloned mount
+		 * namespace.  The domain runtime mount remap makes that name land
+		 * on the cloned btrfs snapshot without lengthening sockaddr_un.
+		 */
+		if (superfork_unix_listener_path_is_clone_runtime(src_path,
+								 config, i)) {
+			if (clone_owned)
+				*clone_owned = true;
+			return kstrdup(src_path, GFP_KERNEL);
+		}
+	}
+
+	if (!best_dst)
+		return superfork_short_external_unix_listener_path(src_path, config);
+
+	if (clone_owned)
+		*clone_owned = true;
+
+	suffix = src_path + best_src_len;
+	dst_len = strlen(best_dst);
+
+	if (!suffix[0])
+		return kstrdup(best_dst, GFP_KERNEL);
+
+	dst_has_slash = dst_len && best_dst[dst_len - 1] == '/';
+	suffix_has_slash = suffix[0] == '/';
+
+	if (dst_has_slash && suffix_has_slash)
+		return kasprintf(GFP_KERNEL, "%s%s", best_dst, suffix + 1);
+
+	if (!dst_has_slash && !suffix_has_slash)
+		return kasprintf(GFP_KERNEL, "%s/%s", best_dst, suffix);
+
+	return kasprintf(GFP_KERNEL, "%s%s", best_dst, suffix);
 }
 
 static char *superfork_remap_snapshot_path(const char *src_path,
@@ -1713,18 +1902,24 @@ out_err:
  * fd table.
  */
 static struct file *superfork_create_unix_server(struct file *src_file,
-						  const struct container_config *config)
+						  const struct container_config *config,
+						  const struct sf_ns_domain *domain)
 {
 	struct unix_sock *u = unix_get_socket(src_file);
 	struct socket *sock = src_file->private_data;
 	struct socket *new_sock = NULL;
 	struct sockaddr_un addr = {};
 	char *src_path = NULL;
-	char *dst_path = NULL;
+	char *bind_path = NULL;
 	struct file *new_file = NULL;
+	struct nsproxy *saved_nsproxy = NULL;
+	struct path saved_root = {};
+	struct path saved_pwd = {};
+	struct sf_fd_endpoint_attrs attrs;
 	int sock_type;
 	int backlog;
 	int ret;
+	bool clone_owned = false;
 
 	if (!u || !u->addr)
 		return ERR_PTR(-EINVAL);
@@ -1739,52 +1934,24 @@ static struct file *superfork_create_unix_server(struct file *src_file,
 		goto out_err;
 	}
 
-	dst_path = superfork_remap_snapshot_path(src_path, config);
-	if (!dst_path) {
-		ret = -ENOMEM;
+	bind_path = superfork_remap_unix_listener_bind_path(src_path, config,
+							    &clone_owned);
+	if (!bind_path) {
+		pr_info("superfork: refusing to recreate unix listener without safe clone path: '%s'\n",
+			src_path);
+		ret = -EXDEV;
 		goto out_err;
 	}
 
-	if (strlen(dst_path) >= UNIX_PATH_MAX) {
-		char *short_path;
+	if (!clone_owned)
+		pr_info("superfork: recreating external unix listener '%s' at private path '%s'\n",
+			src_path, bind_path);
 
-		short_path = superfork_short_run_socket_path(src_path, config);
-		if (!short_path) {
-			pr_err("superfork: remapped unix socket path too long: %s\n",
-			       dst_path);
-			ret = -ENAMETOOLONG;
-			goto out_err;
-		}
-
-		if (strlen(short_path) >= UNIX_PATH_MAX) {
-			pr_err("superfork: synthesized unix socket path still too long: %s\n",
-			       short_path);
-			kfree(short_path);
-			ret = -ENAMETOOLONG;
-			goto out_err;
-		}
-
-		pr_info("superfork: remapped unix socket path too long, using short path '%s' for source '%s'\n",
-			short_path, src_path);
-		kfree(dst_path);
-		dst_path = short_path;
-	}
-
-	/*
-	 * The btrfs snapshot copies the source socket inode into the clone
-	 * directory.  Remove it so bind() can create a fresh one.
-	 */
-	{
-		struct path stale;
-
-		if (kern_path(dst_path, 0, &stale) == 0) {
-			inode_lock(d_inode(stale.dentry->d_parent));
-			vfs_unlink(mnt_idmap(stale.mnt),
-				   d_inode(stale.dentry->d_parent),
-				   stale.dentry, NULL);
-			inode_unlock(d_inode(stale.dentry->d_parent));
-			path_put(&stale);
-		}
+	if (strlen(bind_path) >= UNIX_PATH_MAX) {
+		pr_err("superfork: unix listener bind path too long: '%s' from source '%s'\n",
+		       bind_path, src_path);
+		ret = -ENAMETOOLONG;
+		goto out_err;
 	}
 
 	ret = sock_create_kern(&init_net, AF_UNIX, sock_type, 0, &new_sock);
@@ -1793,16 +1960,54 @@ static struct file *superfork_create_unix_server(struct file *src_file,
 		goto out_err;
 	}
 
+	ret = superfork_switch_current_to_domain_mntns(domain, &saved_nsproxy,
+						       &saved_root, &saved_pwd);
+	if (ret < 0) {
+		pr_err("superfork: failed to enter cloned mount namespace for unix listener '%s': %d\n",
+		       bind_path, ret);
+		goto out_err;
+	}
+
+	/*
+	 * The btrfs snapshot copies the source socket inode into the clone
+	 * directory.  Remove it in the cloned mount namespace so bind() can
+	 * create a fresh listener without touching the source path.
+	 */
+	{
+		struct path stale;
+
+		ret = kern_path(bind_path, 0, &stale);
+		if (ret == 0) {
+			inode_lock(d_inode(stale.dentry->d_parent));
+			ret = vfs_unlink(mnt_idmap(stale.mnt),
+					 d_inode(stale.dentry->d_parent),
+					 stale.dentry, NULL);
+			inode_unlock(d_inode(stale.dentry->d_parent));
+			path_put(&stale);
+			if (ret < 0) {
+				pr_err("superfork: failed to unlink stale unix listener '%s': %d\n",
+				       bind_path, ret);
+				goto out_restore;
+			}
+		} else if (ret == -ENOENT) {
+			ret = 0;
+		} else {
+			pr_err("superfork: failed to look up unix listener '%s': %d\n",
+			       bind_path, ret);
+			goto out_restore;
+		}
+	}
+
 	addr.sun_family = AF_UNIX;
-	strscpy(addr.sun_path, dst_path, sizeof(addr.sun_path));
+	strscpy(addr.sun_path, bind_path, sizeof(addr.sun_path));
 
 	ret = kernel_bind(new_sock,
 			  (struct sockaddr *)&addr,
 			  sizeof(sa_family_t) + strlen(addr.sun_path) + 1);
 	if (ret < 0) {
 		pr_err("superfork: failed to bind unix socket to %s: %d\n",
-		       dst_path, ret);
-		goto out_err;
+		       bind_path, ret);
+		goto out_restore;
 	}
 
 	/* Use the same backlog as a typical QEMU chardev server (128) */
@@ -1810,14 +2015,18 @@ static struct file *superfork_create_unix_server(struct file *src_file,
 	ret = kernel_listen(new_sock, backlog);
 	if (ret < 0) {
 		pr_err("superfork: failed to listen on unix socket %s: %d\n",
-		       dst_path, ret);
-		goto out_err;
+		       bind_path, ret);
+		goto out_restore;
 	}
+
+	superfork_restore_current_mntns(saved_nsproxy, &saved_root, &saved_pwd);
+	saved_nsproxy = NULL;
 
 	/*
 	 * sock_alloc_file() hands off ownership of new_sock to the returned
 	 * file; new_sock must not be released separately after this point.
 	 */
+	superfork_capture_fd_endpoint_attrs(src_file, &attrs);
 	new_file = sock_alloc_file(new_sock,
 				   src_file->f_flags & ~(O_CREAT | O_EXCL | O_TRUNC),
 				   NULL);
@@ -1828,22 +2037,28 @@ static struct file *superfork_create_unix_server(struct file *src_file,
 		new_file = NULL;
 		goto out_err;
 	}
+	superfork_apply_fd_endpoint_attrs(new_file, &attrs, O_NONBLOCK);
 
-	kfree(dst_path);
+	pr_info("superfork: recreated unix listener source='%s' bind='%s' type=%d flags=0x%x clone_owned=%d\n",
+		src_path, bind_path, sock_type, attrs.f_flags,
+		(int)clone_owned);
+	kfree(bind_path);
 	kfree(src_path);
 	return new_file;
 
+out_restore:
+	superfork_restore_current_mntns(saved_nsproxy, &saved_root, &saved_pwd);
+	saved_nsproxy = NULL;
 out_err:
 	if (new_sock)
 		sock_release(new_sock);
-	kfree(dst_path);
+	kfree(bind_path);
 	kfree(src_path);
 	return ERR_PTR(ret);
 }
 
 static int superfork_create_internal_unix_pair(struct sf_unix_sock_edge *edge)
 {
-	struct socket *src_sock;
 	struct socket *sock1 = NULL;
 	struct socket *sock2 = NULL;
 	struct file *file1;
@@ -1858,13 +2073,14 @@ static int superfork_create_internal_unix_pair(struct sf_unix_sock_edge *edge)
 	if (edge->new_file[0] && edge->new_file[1])
 		return 0;
 
-	src_sock = sock_from_file(edge->src_file[0]);
-	if (!src_sock)
+	sock_type = edge->attrs[0].sock_type;
+	if (!sock_type)
+		sock_type = edge->attrs[1].sock_type;
+	if (!sock_type)
 		return -EINVAL;
 
-	sock_type = src_sock->type;
-	flags1 = edge->src_file[0]->f_flags & O_NONBLOCK;
-	flags2 = edge->src_file[1]->f_flags & O_NONBLOCK;
+	flags1 = edge->attrs[0].f_flags & O_NONBLOCK;
+	flags2 = edge->attrs[1].f_flags & O_NONBLOCK;
 
 	ret = sock_create(PF_UNIX, sock_type, 0, &sock1);
 	if (ret < 0)
@@ -1897,11 +2113,15 @@ static int superfork_create_internal_unix_pair(struct sf_unix_sock_edge *edge)
 		goto out_release_sock2;
 	}
 
+	superfork_apply_fd_endpoint_attrs(file1, &edge->attrs[0], O_NONBLOCK);
+	superfork_apply_fd_endpoint_attrs(file2, &edge->attrs[1], O_NONBLOCK);
 	edge->new_file[0] = file1;
 	edge->new_file[1] = file2;
-	pr_info("superfork: internal unix pair create left=%d fd=%u -> new=%p right=%d fd=%u -> new=%p type=%d\n",
+	pr_info("superfork: internal unix pair create left=%d fd=%u -> new=%p flags=0x%x right=%d fd=%u -> new=%p flags=0x%x type=%d\n",
 		edge->src_tgid[0], edge->src_fd[0], edge->new_file[0],
+		edge->attrs[0].f_flags,
 		edge->src_tgid[1], edge->src_fd[1], edge->new_file[1],
+		edge->attrs[1].f_flags,
 		sock_type);
 	return 0;
 
@@ -2016,8 +2236,13 @@ static struct file *superfork_create_external_unix_placeholder(
 	if (!src_sock || !unix_get_socket(src_file))
 		return NULL;
 
-	sock_type = src_sock->type;
-	flags = src_file->f_flags & O_NONBLOCK;
+	{
+		struct sf_fd_endpoint_attrs attrs;
+
+		superfork_capture_fd_endpoint_attrs(src_file, &attrs);
+		sock_type = attrs.sock_type ? attrs.sock_type : src_sock->type;
+		flags = attrs.f_flags & O_NONBLOCK;
+	}
 
 	ret = sock_create(PF_UNIX, sock_type, 0, &sock1);
 	if (ret < 0)
@@ -2057,8 +2282,8 @@ static struct file *superfork_create_external_unix_placeholder(
 		return ERR_PTR(ret);
 	}
 
-	pr_info("superfork: fd placeholder unix socket owner=%d src=%pD2 type=%d\n",
-		owner_task->pid, src_file, sock_type);
+	pr_info("superfork: fd placeholder unix socket owner=%d src=%pD2 type=%d flags=0x%x\n",
+		owner_task->pid, src_file, sock_type, flags);
 	return file1;
 
 out_release_pair:
@@ -2076,6 +2301,8 @@ out_release_sock2:
 static int superfork_create_internal_pipe_pair(struct sf_pipe_edge *edge)
 {
 	struct file *files[2];
+	int pipe_slot0;
+	int pipe_slot1;
 	int flags = 0;
 	int ret;
 
@@ -2084,15 +2311,26 @@ static int superfork_create_internal_pipe_pair(struct sf_pipe_edge *edge)
 	if (edge->new_file[0] && edge->new_file[1])
 		return 0;
 
-	flags |= (edge->src_file[0]->f_flags | edge->src_file[1]->f_flags) &
-		 (O_NONBLOCK | O_DIRECT);
+	pipe_slot0 = superfork_pipe_slot_for_endpoint(&edge->attrs[0]);
+	pipe_slot1 = superfork_pipe_slot_for_endpoint(&edge->attrs[1]);
+	if (pipe_slot0 < 0 || pipe_slot1 < 0 || pipe_slot0 == pipe_slot1)
+		return -EINVAL;
+
+	flags |= (edge->attrs[0].f_flags | edge->attrs[1].f_flags) & O_DIRECT;
 
 	ret = create_pipe_files(files, flags);
 	if (ret < 0)
 		return ret;
 
-	edge->new_file[0] = files[0];
-	edge->new_file[1] = files[1];
+	edge->new_file[0] = files[pipe_slot0];
+	edge->new_file[1] = files[pipe_slot1];
+	superfork_apply_fd_endpoint_attrs(edge->new_file[0], &edge->attrs[0],
+					  SF_FD_PAIR_STATUS_FLAGS);
+	superfork_apply_fd_endpoint_attrs(edge->new_file[1], &edge->attrs[1],
+					  SF_FD_PAIR_STATUS_FLAGS);
+	pr_info("superfork: internal pipe pair create read_slot=%d flags0=0x%x flags1=0x%x create_flags=0x%x\n",
+		pipe_slot0 == 0 ? 0 : 1, edge->attrs[0].f_flags,
+		edge->attrs[1].f_flags, flags);
 	return 0;
 }
 
@@ -2119,27 +2357,28 @@ static struct file *superfork_create_external_pipe_placeholder(
 				struct file *src_file,
 				struct task_struct *owner_task)
 {
+	struct sf_fd_endpoint_attrs attrs;
 	struct file *files[2];
 	struct file *replacement;
 	struct file *peer;
-	int flags = src_file->f_flags & (O_NONBLOCK | O_DIRECT);
+	int replacement_slot;
+	int flags;
 	int ret;
 
-	if (!!(src_file->f_mode & FMODE_READ) ==
-	    !!(src_file->f_mode & FMODE_WRITE))
+	superfork_capture_fd_endpoint_attrs(src_file, &attrs);
+	replacement_slot = superfork_pipe_slot_for_endpoint(&attrs);
+	if (replacement_slot < 0)
 		return NULL;
 
+	flags = attrs.f_flags & O_DIRECT;
 	ret = create_pipe_files(files, flags);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (src_file->f_mode & FMODE_READ) {
-		replacement = files[0];
-		peer = files[1];
-	} else {
-		replacement = files[1];
-		peer = files[0];
-	}
+	replacement = files[replacement_slot];
+	peer = files[replacement_slot ^ 1];
+	superfork_apply_fd_endpoint_attrs(replacement, &attrs,
+					  SF_FD_PAIR_STATUS_FLAGS);
 
 	ret = superfork_register_placeholder_peer(owner_task, peer);
 	if (ret < 0) {
@@ -2148,8 +2387,9 @@ static struct file *superfork_create_external_pipe_placeholder(
 		return ERR_PTR(ret);
 	}
 
-	pr_info("superfork: fd placeholder pipe owner=%d src=%pD2 mode=0x%x\n",
-		owner_task->pid, src_file, src_file->f_mode);
+	pr_info("superfork: fd placeholder pipe owner=%d src=%pD2 mode=0x%x flags=0x%x slot=%d\n",
+		owner_task->pid, src_file, attrs.f_mode, attrs.f_flags,
+		replacement_slot);
 	return replacement;
 }
 
@@ -3174,7 +3414,8 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				break;
 			case FD_ACT_UNIX_SOCK_SERVER:
 				replacement = superfork_create_unix_server(action.file,
-									   config);
+									   config,
+									   domain);
 				if (IS_ERR(replacement)) {
 					ret = PTR_ERR(replacement);
 					pr_err("superfork: failed to recreate unix server socket at fd %u: %d\n",
@@ -3807,6 +4048,26 @@ static int superfork_verify_internal_unix_edges(struct container_clone_ctx *ctx)
 			return -EUCLEAN;
 		}
 
+		if (sock0->type != edge->attrs[0].sock_type ||
+		    sock1->type != edge->attrs[1].sock_type ||
+		    !superfork_fd_endpoint_flags_match(edge->new_file[0],
+						       &edge->attrs[0],
+						       O_NONBLOCK) ||
+		    !superfork_fd_endpoint_flags_match(edge->new_file[1],
+						       &edge->attrs[1],
+						       O_NONBLOCK)) {
+			pr_err("superfork: internal unix edge %u mode mismatch left=%d fd=%u flags=0x%x/0x%x type=%d/%d right=%d fd=%u flags=0x%x/0x%x type=%d/%d\n",
+			       i, edge->src_tgid[0], edge->src_fd[0],
+			       edge->new_file[0]->f_flags & O_NONBLOCK,
+			       edge->attrs[0].f_flags & O_NONBLOCK,
+			       sock0->type, edge->attrs[0].sock_type,
+			       edge->src_tgid[1], edge->src_fd[1],
+			       edge->new_file[1]->f_flags & O_NONBLOCK,
+			       edge->attrs[1].f_flags & O_NONBLOCK,
+			       sock1->type, edge->attrs[1].sock_type);
+			return -EUCLEAN;
+		}
+
 		peer = unix_peer_get(sock0->sk);
 		if (!peer || peer != sock1->sk) {
 			if (peer)
@@ -3844,6 +4105,31 @@ static int superfork_verify_internal_pipe_edges(struct container_clone_ctx *ctx)
 		pipe1 = get_pipe_info(edge->new_file[1], false);
 		if (!pipe0 || !pipe1 || pipe0 != pipe1) {
 			pr_err("superfork: internal pipe edge %u peer mismatch\n", i);
+			return -EUCLEAN;
+		}
+
+		if (superfork_pipe_slot_for_endpoint(&edge->attrs[0]) < 0 ||
+		    superfork_pipe_slot_for_endpoint(&edge->attrs[1]) < 0 ||
+		    !!(edge->new_file[0]->f_mode & FMODE_READ) !=
+			    !!(edge->attrs[0].f_mode & FMODE_READ) ||
+		    !!(edge->new_file[0]->f_mode & FMODE_WRITE) !=
+			    !!(edge->attrs[0].f_mode & FMODE_WRITE) ||
+		    !!(edge->new_file[1]->f_mode & FMODE_READ) !=
+			    !!(edge->attrs[1].f_mode & FMODE_READ) ||
+		    !!(edge->new_file[1]->f_mode & FMODE_WRITE) !=
+			    !!(edge->attrs[1].f_mode & FMODE_WRITE) ||
+		    !superfork_fd_endpoint_flags_match(edge->new_file[0],
+						       &edge->attrs[0],
+						       SF_FD_PAIR_STATUS_FLAGS) ||
+		    !superfork_fd_endpoint_flags_match(edge->new_file[1],
+						       &edge->attrs[1],
+						       SF_FD_PAIR_STATUS_FLAGS)) {
+			pr_err("superfork: internal pipe edge %u mode mismatch flags0=0x%x/0x%x flags1=0x%x/0x%x\n",
+			       i,
+			       edge->new_file[0]->f_flags & SF_FD_PAIR_STATUS_FLAGS,
+			       edge->attrs[0].f_flags & SF_FD_PAIR_STATUS_FLAGS,
+			       edge->new_file[1]->f_flags & SF_FD_PAIR_STATUS_FLAGS,
+			       edge->attrs[1].f_flags & SF_FD_PAIR_STATUS_FLAGS);
 			return -EUCLEAN;
 		}
 	}
