@@ -1093,6 +1093,11 @@ struct tgid_clone_entry *find_or_create_tgid_entry(
 	ctx->tgids[ctx->tgid_count].shared_sighand = NULL;
 	ctx->tgids[ctx->tgid_count].shared_files = NULL;
 	ctx->tgids[ctx->tgid_count].shared_fs = NULL;
+	ctx->tgids[ctx->tgid_count].fs_share_count = 0;
+	ctx->tgids[ctx->tgid_count].cred_share_count = 0;
+	ctx->tgids[ctx->tgid_count].kvm_vm_count = 0;
+	ctx->tgids[ctx->tgid_count].procfs_reopen_count = 0;
+	ctx->tgids[ctx->tgid_count].pidfd_reopen_count = 0;
 
 	return &ctx->tgids[ctx->tgid_count++];
 }

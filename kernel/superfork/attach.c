@@ -50,9 +50,12 @@ static bool is_task_in_clone_set(struct container_clone_ctx *ctx,
 
 static pid_t superfork_map_old_pid_to_new_nr(struct container_clone_ctx *ctx,
 					     pid_t old_pid,
+					     struct pid_namespace *old_ns,
 					     struct pid_namespace *ns)
 {
 	if (old_pid <= 0)
+		return 0;
+	if (!old_ns || !ns)
 		return 0;
 
 	for_each_task_in_ctx(ctx) {
@@ -60,7 +63,7 @@ static pid_t superfork_map_old_pid_to_new_nr(struct container_clone_ctx *ctx,
 
 		if (!task->old_task || !task->new_task)
 			continue;
-		if (task->old_task->pid != old_pid)
+		if (task_pid_nr_ns(task->old_task, old_ns) != old_pid)
 			continue;
 
 		return task_pid_nr_ns(task->new_task, ns);
@@ -74,6 +77,7 @@ static void superfork_remap_wait_syscall_args(struct container_clone_ctx *ctx,
 {
 	struct task_struct *p;
 	struct pt_regs *regs;
+	struct pid_namespace *old_ns;
 	struct pid_namespace *ns;
 	unsigned long args[6];
 	pid_t old_pid, new_pid;
@@ -92,7 +96,8 @@ static void superfork_remap_wait_syscall_args(struct container_clone_ctx *ctx,
 		return;
 
 	ns = task_active_pid_ns(p);
-	if (!ns)
+	old_ns = task_active_pid_ns(task->old_task);
+	if (!ns || !old_ns)
 		return;
 
 	syscall_get_arguments(p, regs, args);
@@ -103,7 +108,8 @@ static void superfork_remap_wait_syscall_args(struct container_clone_ctx *ctx,
 		if (old_pid <= 0)
 			return;
 
-		new_pid = superfork_map_old_pid_to_new_nr(ctx, old_pid, ns);
+		new_pid = superfork_map_old_pid_to_new_nr(ctx, old_pid, old_ns,
+							 ns);
 		if (!new_pid)
 			return;
 
@@ -121,7 +127,8 @@ static void superfork_remap_wait_syscall_args(struct container_clone_ctx *ctx,
 		if (old_pid <= 0)
 			return;
 
-		new_pid = superfork_map_old_pid_to_new_nr(ctx, old_pid, ns);
+		new_pid = superfork_map_old_pid_to_new_nr(ctx, old_pid, old_ns,
+							 ns);
 		if (!new_pid)
 			return;
 

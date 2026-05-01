@@ -81,23 +81,78 @@ static inline void superfork_mm_clear_owner(struct mm_struct *mm,
 #endif
 }
 
-static bool superfork_can_share_cred(struct task_struct *src_task,
-				     u64 clone_flags)
+static const struct cred *superfork_find_shared_cred(
+					const struct tgid_clone_entry *tgid_entry,
+					const struct task_struct *src_task)
 {
-#ifdef CONFIG_KEYS
-	const struct cred *src_cred;
-	bool share;
+	int i;
 
-	if (!(clone_flags & CLONE_THREAD))
-		return false;
+	if (!tgid_entry || !src_task || !src_task->real_cred)
+		return NULL;
 
-	src_cred = get_task_cred(src_task);
-	share = !src_cred->thread_keyring;
-	put_cred(src_cred);
-	return share;
-#else
-	return clone_flags & CLONE_THREAD;
-#endif
+	for (i = 0; i < tgid_entry->cred_share_count; i++) {
+		if (tgid_entry->cred_shares[i].src_cred == src_task->real_cred)
+			return tgid_entry->cred_shares[i].new_cred;
+	}
+
+	return NULL;
+}
+
+static int superfork_remember_shared_cred(struct tgid_clone_entry *tgid_entry,
+					  const struct task_struct *src_task,
+					  const struct cred *new_cred)
+{
+	if (!tgid_entry || !src_task || !src_task->real_cred || !new_cred)
+		return -EINVAL;
+
+	if (superfork_find_shared_cred(tgid_entry, src_task))
+		return 0;
+
+	if (tgid_entry->cred_share_count >= MAX_CLONE_TASKS)
+		return -E2BIG;
+
+	tgid_entry->cred_shares[tgid_entry->cred_share_count].src_cred =
+		src_task->real_cred;
+	tgid_entry->cred_shares[tgid_entry->cred_share_count].new_cred =
+		new_cred;
+	tgid_entry->cred_share_count++;
+	return 0;
+}
+
+static struct fs_struct *superfork_find_shared_fs(
+					const struct tgid_clone_entry *tgid_entry,
+					const struct task_struct *src_task)
+{
+	int i;
+
+	if (!tgid_entry || !src_task || !src_task->fs)
+		return NULL;
+
+	for (i = 0; i < tgid_entry->fs_share_count; i++) {
+		if (tgid_entry->fs_shares[i].src_fs == src_task->fs)
+			return tgid_entry->fs_shares[i].new_fs;
+	}
+
+	return NULL;
+}
+
+static int superfork_remember_shared_fs(struct tgid_clone_entry *tgid_entry,
+					const struct task_struct *src_task,
+					struct fs_struct *new_fs)
+{
+	if (!tgid_entry || !src_task || !src_task->fs || !new_fs)
+		return -EINVAL;
+
+	if (superfork_find_shared_fs(tgid_entry, src_task))
+		return 0;
+
+	if (tgid_entry->fs_share_count >= MAX_CLONE_TASKS)
+		return -E2BIG;
+
+	tgid_entry->fs_shares[tgid_entry->fs_share_count].src_fs = src_task->fs;
+	tgid_entry->fs_shares[tgid_entry->fs_share_count].new_fs = new_fs;
+	tgid_entry->fs_share_count++;
+	return 0;
 }
 
 static struct cred *superfork_prepare_task_cred(struct task_struct *src_task,
@@ -149,25 +204,21 @@ static int superfork_copy_creds(struct task_struct *p,
 				u64 clone_flags)
 {
 	struct cred *new;
+	const struct cred *shared;
+	int ret;
 
 #ifdef CONFIG_KEYS_REQUEST_CACHE
 	p->cached_requested_key = NULL;
 #endif
 
-	/*
-	 * Threads in the cloned thread group must share the cloned leader's
-	 * cred object, not the source task's, or the clone can end up tearing
-	 * down source-owned cred state as threads exit.
-	 */
-	if (superfork_can_share_cred(src_task, clone_flags)) {
-		if (!tgid_entry || !tgid_entry->new_leader ||
-		    !tgid_entry->new_leader->cred)
-			return -EINVAL;
-
-		p->cred = tgid_entry->new_leader->cred;
-		p->real_cred = get_cred_many(p->cred, 2);
-		inc_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
-		return 0;
+	if ((clone_flags & CLONE_THREAD) && tgid_entry) {
+		shared = superfork_find_shared_cred(tgid_entry, src_task);
+		if (shared) {
+			p->cred = shared;
+			p->real_cred = get_cred_many(p->cred, 2);
+			inc_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
+			return 0;
+		}
 	}
 
 	/*
@@ -178,6 +229,12 @@ static int superfork_copy_creds(struct task_struct *p,
 	new = superfork_prepare_task_cred(src_task, clone_flags);
 	if (!new)
 		return -ENOMEM;
+
+	ret = superfork_remember_shared_cred(tgid_entry, src_task, new);
+	if (ret < 0) {
+		put_cred(new);
+		return ret;
+	}
 
 	p->cred = p->real_cred = get_cred(new);
 
@@ -268,12 +325,6 @@ static int superfork_resolve_task_fs_path(const struct sf_ns_domain *domain,
 	if (!ret)
 		return 0;
 
-	if (src_path && src_path[0]) {
-		ret = kern_path(src_path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, path);
-		if (!ret)
-			return 0;
-	}
-
 	if (!src_path || !src_path[0] || !strcmp(src_path, "/"))
 		return superfork_domain_lookup_path(domain, "/",
 						    LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
@@ -304,17 +355,20 @@ static int superfork_copy_fs(struct task_struct *p,
 	}
 
 	if (clone_flags & CLONE_FS) {
-		if (!tgid_entry->shared_fs)
+		struct fs_struct *shared_fs = superfork_find_shared_fs(tgid_entry,
+								       src_task);
+
+		if (!shared_fs)
 			return -EINVAL;
 
-		read_seqlock_excl(&tgid_entry->shared_fs->seq);
-		if (tgid_entry->shared_fs->in_exec) {
-			read_sequnlock_excl(&tgid_entry->shared_fs->seq);
+		read_seqlock_excl(&shared_fs->seq);
+		if (shared_fs->in_exec) {
+			read_sequnlock_excl(&shared_fs->seq);
 			return -EAGAIN;
 		}
-		tgid_entry->shared_fs->users++;
-		read_sequnlock_excl(&tgid_entry->shared_fs->seq);
-		p->fs = tgid_entry->shared_fs;
+		shared_fs->users++;
+		read_sequnlock_excl(&shared_fs->seq);
+		p->fs = shared_fs;
 		return 0;
 	}
 
@@ -354,8 +408,15 @@ static int superfork_copy_fs(struct task_struct *p,
 	path_put(&new_root);
 	path_put(&new_pwd);
 
+	ret = superfork_remember_shared_fs(tgid_entry, src_task, fs);
+	if (ret < 0) {
+		free_fs_struct(fs);
+		return ret;
+	}
+
 	p->fs = fs;
-	tgid_entry->shared_fs = fs;
+	if (src_task->group_leader && src_task->fs == src_task->group_leader->fs)
+		tgid_entry->shared_fs = fs;
 	return 0;
 }
 

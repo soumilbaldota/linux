@@ -24,6 +24,7 @@
 #include <linux/pid.h>
 #include <linux/pidfs.h>
 #include <linux/pipe_fs_i.h>
+#include <linux/proc_fs.h>
 #include <linux/security.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
@@ -2454,6 +2455,7 @@ static int superfork_queue_procfs_reopen(struct tgid_clone_entry *tgid_entry,
 	}
 
 	reopen.fd = action->fd;
+	reopen.old_pid_ns = proc_pid_ns(file_inode(action->file)->i_sb);
 	reopen.open_flags = action->file->f_flags &
 		~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_TMPFILE);
 	spin_lock(&action->file->f_lock);
@@ -2535,11 +2537,11 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 			continue;
 		}
 
-		if (action.type == FD_ACT_PROCFS_REOPEN) {
-			ret = superfork_queue_procfs_reopen(tgid_entry, &action);
-			if (ret < 0) {
-				fput(action.file);
-				goto out;
+			if (action.type == FD_ACT_PROCFS_REOPEN) {
+				ret = superfork_queue_procfs_reopen(tgid_entry, &action);
+				if (ret < 0) {
+					fput(action.file);
+					goto out;
 			}
 		}
 
@@ -3331,14 +3333,18 @@ out:
 
 static pid_t superfork_map_old_pid_to_new_nr(struct container_clone_ctx *ctx,
 					     pid_t old_pid,
+					     struct pid_namespace *old_ns,
 					     struct pid_namespace *ns)
 {
+	if (!old_ns || !ns)
+		return 0;
+
 	for_each_task_in_ctx(ctx) {
 		struct task_clone_entry *task = get_ctx_task(ctx, i);
 
 		if (!task->old_task || !task->new_task)
 			continue;
-		if (task->old_task->pid != old_pid)
+		if (task_pid_nr_ns(task->old_task, old_ns) != old_pid)
 			continue;
 
 		return task_pid_nr_ns(task->new_task, ns);
@@ -3367,8 +3373,9 @@ static struct task_struct *superfork_map_old_pid_to_new_task(
 
 static char *superfork_build_procfs_reopen_path(struct container_clone_ctx *ctx,
 						const struct sf_procfs_reopen *reopen,
-						struct pid_namespace *ns)
+						struct pid_namespace *new_ns)
 {
+	struct pid_namespace *old_ns;
 	pid_t proc_pid;
 	char *path;
 
@@ -3380,7 +3387,9 @@ static char *superfork_build_procfs_reopen_path(struct container_clone_ctx *ctx,
 		return path ? path : ERR_PTR(-ENOMEM);
 	}
 
-	proc_pid = superfork_map_old_pid_to_new_nr(ctx, reopen->old_pid, ns);
+	old_ns = reopen->old_pid_ns ? reopen->old_pid_ns : new_ns;
+	proc_pid = superfork_map_old_pid_to_new_nr(ctx, reopen->old_pid, old_ns,
+						 new_ns);
 	if (proc_pid <= 0)
 		return ERR_PTR(-ESRCH);
 
@@ -3395,11 +3404,13 @@ static char *superfork_build_procfs_reopen_path(struct container_clone_ctx *ctx,
 		pid_t new_tid;
 		int ret;
 
-		ret = superfork_parse_pid_component(reopen->relpath + 5, &end, &old_tid);
+		ret = superfork_parse_pid_component(reopen->relpath + 5, &end,
+						    &old_tid);
 		if (ret < 0)
 			return ERR_PTR(ret);
 
-		new_tid = superfork_map_old_pid_to_new_nr(ctx, old_tid, ns);
+		new_tid = superfork_map_old_pid_to_new_nr(ctx, old_tid, old_ns,
+							  new_ns);
 		if (new_tid <= 0)
 			return ERR_PTR(-ESRCH);
 

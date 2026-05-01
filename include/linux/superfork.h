@@ -15,6 +15,7 @@
 struct task_struct;
 struct signal_struct;
 struct sighand_struct;
+struct cred;
 struct pid_namespace;
 struct nsproxy;
 struct fs_struct;
@@ -130,9 +131,20 @@ struct container_config {
 struct sf_procfs_reopen {
 	unsigned int fd;
 	pid_t        old_pid;
+	struct pid_namespace *old_pid_ns;
 	int          open_flags;
 	loff_t       pos;
 	char         relpath[256];
+};
+
+struct sf_fs_share_entry {
+	const struct fs_struct *src_fs;
+	struct fs_struct *new_fs;
+};
+
+struct sf_cred_share_entry {
+	const struct cred *src_cred;
+	const struct cred *new_cred;
 };
 
 struct sf_pidfd_reopen {
@@ -180,6 +192,10 @@ struct tgid_clone_entry {
 	struct sighand_struct *shared_sighand;
 	struct files_struct *shared_files;
 	struct fs_struct *shared_fs;
+	struct sf_fs_share_entry fs_shares[MAX_CLONE_TASKS];
+	int fs_share_count;
+	struct sf_cred_share_entry cred_shares[MAX_CLONE_TASKS];
+	int cred_share_count;
 	/* KVM fd replacement map is keyed per leader because files/mm are leader-shared. */
 	struct sf_kvm_vm_map kvm_vms[SF_MAX_KVM_VMS_PER_PROC];
 	int kvm_vm_count;
