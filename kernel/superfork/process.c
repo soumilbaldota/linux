@@ -81,21 +81,54 @@ static inline void superfork_mm_clear_owner(struct mm_struct *mm,
 #endif
 }
 
+static void *superfork_find_shared_object(
+				const struct sf_shared_obj_entry *shares,
+				int share_count,
+				const void *src_obj)
+{
+	int i;
+
+	if (!shares || !src_obj)
+		return NULL;
+
+	for (i = 0; i < share_count; i++) {
+		if (shares[i].src_obj == src_obj)
+			return shares[i].new_obj;
+	}
+
+	return NULL;
+}
+
+static int superfork_remember_shared_object(struct sf_shared_obj_entry *shares,
+					    int *share_count,
+					    const void *src_obj,
+					    void *new_obj)
+{
+	if (!shares || !share_count || !src_obj || !new_obj)
+		return -EINVAL;
+
+	if (superfork_find_shared_object(shares, *share_count, src_obj))
+		return 0;
+
+	if (*share_count >= MAX_CLONE_TASKS)
+		return -E2BIG;
+
+	shares[*share_count].src_obj = src_obj;
+	shares[*share_count].new_obj = new_obj;
+	(*share_count)++;
+	return 0;
+}
+
 static const struct cred *superfork_find_shared_cred(
 					const struct tgid_clone_entry *tgid_entry,
 					const struct task_struct *src_task)
 {
-	int i;
-
 	if (!tgid_entry || !src_task || !src_task->real_cred)
 		return NULL;
 
-	for (i = 0; i < tgid_entry->cred_share_count; i++) {
-		if (tgid_entry->cred_shares[i].src_cred == src_task->real_cred)
-			return tgid_entry->cred_shares[i].new_cred;
-	}
-
-	return NULL;
+	return superfork_find_shared_object(tgid_entry->cred_shares,
+					    tgid_entry->cred_share_count,
+					    src_task->real_cred);
 }
 
 static int superfork_remember_shared_cred(struct tgid_clone_entry *tgid_entry,
@@ -105,35 +138,22 @@ static int superfork_remember_shared_cred(struct tgid_clone_entry *tgid_entry,
 	if (!tgid_entry || !src_task || !src_task->real_cred || !new_cred)
 		return -EINVAL;
 
-	if (superfork_find_shared_cred(tgid_entry, src_task))
-		return 0;
-
-	if (tgid_entry->cred_share_count >= MAX_CLONE_TASKS)
-		return -E2BIG;
-
-	tgid_entry->cred_shares[tgid_entry->cred_share_count].src_cred =
-		src_task->real_cred;
-	tgid_entry->cred_shares[tgid_entry->cred_share_count].new_cred =
-		new_cred;
-	tgid_entry->cred_share_count++;
-	return 0;
+	return superfork_remember_shared_object(tgid_entry->cred_shares,
+						&tgid_entry->cred_share_count,
+						src_task->real_cred,
+						(void *)new_cred);
 }
 
 static struct fs_struct *superfork_find_shared_fs(
 					const struct tgid_clone_entry *tgid_entry,
 					const struct task_struct *src_task)
 {
-	int i;
-
 	if (!tgid_entry || !src_task || !src_task->fs)
 		return NULL;
 
-	for (i = 0; i < tgid_entry->fs_share_count; i++) {
-		if (tgid_entry->fs_shares[i].src_fs == src_task->fs)
-			return tgid_entry->fs_shares[i].new_fs;
-	}
-
-	return NULL;
+	return superfork_find_shared_object(tgid_entry->fs_shares,
+					    tgid_entry->fs_share_count,
+					    src_task->fs);
 }
 
 static int superfork_remember_shared_fs(struct tgid_clone_entry *tgid_entry,
@@ -143,16 +163,9 @@ static int superfork_remember_shared_fs(struct tgid_clone_entry *tgid_entry,
 	if (!tgid_entry || !src_task || !src_task->fs || !new_fs)
 		return -EINVAL;
 
-	if (superfork_find_shared_fs(tgid_entry, src_task))
-		return 0;
-
-	if (tgid_entry->fs_share_count >= MAX_CLONE_TASKS)
-		return -E2BIG;
-
-	tgid_entry->fs_shares[tgid_entry->fs_share_count].src_fs = src_task->fs;
-	tgid_entry->fs_shares[tgid_entry->fs_share_count].new_fs = new_fs;
-	tgid_entry->fs_share_count++;
-	return 0;
+	return superfork_remember_shared_object(tgid_entry->fs_shares,
+						&tgid_entry->fs_share_count,
+						src_task->fs, new_fs);
 }
 
 static struct cred *superfork_prepare_task_cred(struct task_struct *src_task,

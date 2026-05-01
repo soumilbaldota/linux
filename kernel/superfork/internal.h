@@ -6,6 +6,7 @@
 #ifndef _SUPERFORK_INTERNAL_H
 #define _SUPERFORK_INTERNAL_H
 
+#include <linux/string.h>
 #include <linux/superfork.h>
 
 /*
@@ -20,6 +21,49 @@ static inline struct task_clone_entry *get_ctx_task(struct container_clone_ctx *
 static inline struct sf_ns_domain *get_ctx_domain(struct container_clone_ctx *ctx, int i)
 {
 	return &ctx->domains[i];
+}
+
+static inline bool superfork_comm_is_containerd_shim(const char *comm)
+{
+	return comm && !strcmp(comm, "containerd-shim");
+}
+
+static inline bool superfork_comm_is_virtiofsd(const char *comm)
+{
+	return comm && !strcmp(comm, "virtiofsd");
+}
+
+static inline bool superfork_task_is_containerd_shim(const struct task_struct *task)
+{
+	return task && superfork_comm_is_containerd_shim(task->comm);
+}
+
+static inline bool superfork_task_is_virtiofsd(const struct task_struct *task)
+{
+	return task && superfork_comm_is_virtiofsd(task->comm);
+}
+
+static inline pid_t superfork_map_old_pid_to_new_nr(
+				struct container_clone_ctx *ctx,
+				pid_t old_pid,
+				struct pid_namespace *old_ns,
+				struct pid_namespace *new_ns)
+{
+	if (!ctx || old_pid <= 0 || !old_ns || !new_ns)
+		return 0;
+
+	for_each_task_in_ctx(ctx) {
+		struct task_clone_entry *task = get_ctx_task(ctx, i);
+
+		if (!task->old_task || !task->new_task)
+			continue;
+		if (task_pid_nr_ns(task->old_task, old_ns) != old_pid)
+			continue;
+
+		return task_pid_nr_ns(task->new_task, new_ns);
+	}
+
+	return 0;
 }
 
 /*

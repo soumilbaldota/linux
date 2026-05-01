@@ -259,6 +259,73 @@ struct fd_action {
 	unsigned int pidfd_flags;
 };
 
+static bool superfork_pipe_endpoint_is_orphaned(struct file *src_file);
+
+static bool superfork_owner_uses_external_unix_placeholders(
+				const struct task_struct *owner_task)
+{
+	return superfork_task_is_containerd_shim(owner_task) ||
+	       superfork_task_is_virtiofsd(owner_task);
+}
+
+static bool superfork_should_share_generic_external_unix_socket(
+				struct file *file,
+				const struct task_struct *owner_task)
+{
+	return unix_get_socket(file) &&
+	       !superfork_owner_uses_external_unix_placeholders(owner_task);
+}
+
+static bool superfork_is_external_unix_dgram_endpoint(
+				const struct task_struct *owner_task,
+				const struct fd_action *action)
+{
+	return superfork_task_is_virtiofsd(owner_task) &&
+	       action->sock_family == AF_UNIX &&
+	       action->sock_type == SOCK_DGRAM;
+}
+
+static bool superfork_is_live_device_backed_action(const struct fd_action *action)
+{
+	return action->hint && !strcmp(action->hint, "vhost_vsock");
+}
+
+static bool superfork_should_share_named_fifo(struct file *file)
+{
+	return superfork_is_path_backed_fifo(file);
+}
+
+static bool superfork_should_share_orphan_pipe_endpoint(struct file *file)
+{
+	return superfork_pipe_endpoint_is_orphaned(file);
+}
+
+static void superfork_log_external_unix_placeholder_policy(
+				const struct task_struct *owner_task,
+				unsigned int fd)
+{
+	if (superfork_task_is_containerd_shim(owner_task))
+		pr_info("superfork: isolating containerd-shim external unix socket at fd %u with placeholder\n",
+			fd);
+	else if (superfork_task_is_virtiofsd(owner_task))
+		pr_info("superfork: isolating virtiofsd external unix socket at fd %u with placeholder\n",
+			fd);
+}
+
+static int superfork_share_source_file(struct container_clone_ctx *ctx,
+				       struct file *file,
+				       struct file **replacement)
+{
+	int ret;
+
+	ret = superfork_allow_shared_source_file(ctx, file);
+	if (ret < 0)
+		return ret;
+
+	*replacement = get_file(file);
+	return 0;
+}
+
 struct sf_unix_sock_edge {
 	struct file *src_file[2];
 	struct file *new_file[2];
@@ -2614,19 +2681,18 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				 * fallback is only for sockets whose peer lives
 				 * outside the clone set.
 				 */
-				if (!replacement && unix_get_socket(action.file) &&
-				    (!owner_task ||
-				     (strcmp(owner_task->comm, "containerd-shim") &&
-				      strcmp(owner_task->comm, "virtiofsd")))) {
-					ret = superfork_allow_shared_source_file(ctx,
-									 action.file);
+				if (!replacement &&
+				    superfork_should_share_generic_external_unix_socket(
+					    action.file, owner_task)) {
+					ret = superfork_share_source_file(ctx,
+									  action.file,
+									  &replacement);
 					if (ret < 0) {
 						pr_err("superfork: failed to record shared external unix socket at fd %u: %d\n",
 						       action.fd, ret);
 						fput(action.file);
 						goto out;
 					}
-					replacement = get_file(action.file);
 					/*
 					 * dup_files() already left this shared
 					 * external socket installed in the
@@ -2644,14 +2710,8 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 				}
 
 				if (!replacement) {
-					if (owner_task &&
-					    !strcmp(owner_task->comm, "containerd-shim"))
-						pr_info("superfork: isolating containerd-shim external unix socket at fd %u with placeholder\n",
-							action.fd);
-					else if (owner_task &&
-						 !strcmp(owner_task->comm, "virtiofsd"))
-						pr_info("superfork: isolating virtiofsd external unix socket at fd %u with placeholder\n",
-							action.fd);
+					superfork_log_external_unix_placeholder_policy(
+						owner_task, action.fd);
 
 					/*
 					 * Preserve virtiofsd's Unix datagram socket.
@@ -2667,19 +2727,17 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 					 * continuing to isolate connected external
 					 * control sockets.
 					 */
-					if (owner_task &&
-					    !strcmp(owner_task->comm, "virtiofsd") &&
-					    action.sock_family == AF_UNIX &&
-					    action.sock_type == SOCK_DGRAM) {
-						ret = superfork_allow_shared_source_file(
-							ctx, action.file);
+					if (superfork_is_external_unix_dgram_endpoint(
+						    owner_task, &action)) {
+						ret = superfork_share_source_file(
+							ctx, action.file,
+							&replacement);
 						if (ret < 0) {
 							pr_err("superfork: failed to record shared virtiofsd unix datagram socket at fd %u: %d\n",
 							       action.fd, ret);
 							fput(action.file);
 							goto out;
 						}
-						replacement = get_file(action.file);
 						replacement_kind = "shared_virtiofsd_unix_dgram";
 						replacement_should_track = true;
 						pr_info("superfork: preserving virtiofsd external unix datagram socket at fd %u file=%pD2\n",
@@ -2705,17 +2763,16 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 					 * verification still rejects every other
 					 * unexpected source file leak.
 					 */
-					if (action.hint &&
-					    !strcmp(action.hint, "vhost_vsock")) {
-						ret = superfork_allow_shared_source_file(
-							ctx, action.file);
+					if (superfork_is_live_device_backed_action(&action)) {
+						ret = superfork_share_source_file(
+							ctx, action.file,
+							&replacement);
 						if (ret < 0) {
 							pr_err("superfork: failed to record shared vhost-vsock file at fd %u: %d\n",
 							       action.fd, ret);
 							fput(action.file);
 							goto out;
 						}
-						replacement = get_file(action.file);
 						replacement_kind = "shared_vhost_vsock";
 						replacement_should_track = true;
 						pr_info("superfork: preserving shared vhost-vsock backend at fd %u file=%pD2\n",
@@ -2764,16 +2821,16 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 					 * still rejects every other accidental source
 					 * file leak.
 					 */
-					if (superfork_is_path_backed_fifo(action.file)) {
-						ret = superfork_allow_shared_source_file(
-							ctx, action.file);
+					if (superfork_should_share_named_fifo(action.file)) {
+						ret = superfork_share_source_file(
+							ctx, action.file,
+							&replacement);
 						if (ret < 0) {
 							pr_err("superfork: failed to record shared named fifo at fd %u: %d\n",
 							       action.fd, ret);
 							fput(action.file);
 							goto out;
 						}
-						replacement = get_file(action.file);
 						replacement_kind = "shared_named_fifo";
 						replacement_should_track = true;
 						pr_info("superfork: preserving shared named fifo at fd %u file=%pD2 flags=0x%x\n",
@@ -2794,17 +2851,17 @@ static int superfork_sanitize_inherited_fds(struct files_struct *files,
 					 * state, keep sharing the exact live file
 					 * object instead.
 					 */
-					if (superfork_pipe_endpoint_is_orphaned(
+					if (superfork_should_share_orphan_pipe_endpoint(
 						    action.file)) {
-						ret = superfork_allow_shared_source_file(
-							ctx, action.file);
+						ret = superfork_share_source_file(
+							ctx, action.file,
+							&replacement);
 						if (ret < 0) {
 							pr_err("superfork: failed to record shared orphaned pipe endpoint at fd %u: %d\n",
 							       action.fd, ret);
 							fput(action.file);
 							goto out;
 						}
-						replacement = get_file(action.file);
 						replacement_kind = "shared_orphan_pipe";
 						replacement_should_track = true;
 						pr_info("superfork: preserving orphaned pipe endpoint at fd %u file=%pD2 mode=0x%x readers=%u writers=%u files=%u bufs=%u max=%u watch=%d\n",
@@ -3331,38 +3388,24 @@ out:
 	return ret < 0 ? ret : 0;
 }
 
-static pid_t superfork_map_old_pid_to_new_nr(struct container_clone_ctx *ctx,
-					     pid_t old_pid,
-					     struct pid_namespace *old_ns,
-					     struct pid_namespace *ns)
-{
-	if (!old_ns || !ns)
-		return 0;
-
-	for_each_task_in_ctx(ctx) {
-		struct task_clone_entry *task = get_ctx_task(ctx, i);
-
-		if (!task->old_task || !task->new_task)
-			continue;
-		if (task_pid_nr_ns(task->old_task, old_ns) != old_pid)
-			continue;
-
-		return task_pid_nr_ns(task->new_task, ns);
-	}
-
-	return 0;
-}
-
 static struct task_struct *superfork_map_old_pid_to_new_task(
 					struct container_clone_ctx *ctx,
 					pid_t old_pid)
 {
+	pid_t new_pid;
+
+	new_pid = superfork_map_old_pid_to_new_nr(ctx, old_pid,
+						  &init_pid_ns,
+						  &init_pid_ns);
+	if (new_pid <= 0)
+		return NULL;
+
 	for_each_task_in_ctx(ctx) {
 		struct task_clone_entry *task = get_ctx_task(ctx, i);
 
-		if (!task->old_task || !task->new_task)
+		if (!task->new_task)
 			continue;
-		if (task->old_task->pid != old_pid)
+		if (task->new_task->pid != new_pid)
 			continue;
 
 		return task->new_task;

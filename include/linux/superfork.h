@@ -25,6 +25,10 @@ struct kvm_vcpu;
 struct sf_pipe_edge;
 struct sf_unix_sock_edge;
 
+bool superfork_debug_enabled(struct task_struct *task);
+int superfork_debug_track_task(struct task_struct *task);
+void superfork_debug_untrack_task(struct task_struct *task);
+
 /*
  * Snapshot of a vCPU thread's userspace pt_regs, captured at the moment KVM
  * is about to bounce it out of kvm_vcpu_block() due to a freezer signal.
@@ -137,14 +141,9 @@ struct sf_procfs_reopen {
 	char         relpath[256];
 };
 
-struct sf_fs_share_entry {
-	const struct fs_struct *src_fs;
-	struct fs_struct *new_fs;
-};
-
-struct sf_cred_share_entry {
-	const struct cred *src_cred;
-	const struct cred *new_cred;
+struct sf_shared_obj_entry {
+	const void *src_obj;
+	void *new_obj;
 };
 
 struct sf_pidfd_reopen {
@@ -192,9 +191,9 @@ struct tgid_clone_entry {
 	struct sighand_struct *shared_sighand;
 	struct files_struct *shared_files;
 	struct fs_struct *shared_fs;
-	struct sf_fs_share_entry fs_shares[MAX_CLONE_TASKS];
+	struct sf_shared_obj_entry fs_shares[MAX_CLONE_TASKS];
 	int fs_share_count;
-	struct sf_cred_share_entry cred_shares[MAX_CLONE_TASKS];
+	struct sf_shared_obj_entry cred_shares[MAX_CLONE_TASKS];
 	int cred_share_count;
 	/* KVM fd replacement map is keyed per leader because files/mm are leader-shared. */
 	struct sf_kvm_vm_map kvm_vms[SF_MAX_KVM_VMS_PER_PROC];

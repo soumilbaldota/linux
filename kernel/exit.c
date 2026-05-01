@@ -821,7 +821,7 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 	struct task_struct *p, *n;
 	LIST_HEAD(dead);
 
-	if (task_active_pid_ns(tsk) != &init_pid_ns &&
+	if (superfork_debug_enabled(tsk) &&
 	    thread_group_leader(tsk)) {
 		struct task_struct *t;
 		unsigned int thread_count = 0;
@@ -1093,6 +1093,7 @@ void __noreturn do_exit(long code)
 
 	exit_tasks_rcu_start();
 	exit_notify(tsk, group_dead);
+	superfork_debug_untrack_task(tsk);
 	proc_exit_connector(tsk);
 	mpol_put_task_policy(tsk);
 #ifdef CONFIG_FUTEX
@@ -1243,6 +1244,8 @@ static int eligible_pid(struct wait_opts *wo, struct task_struct *p)
 		task_pid_type(p, wo->wo_type) == wo->wo_pid;
 }
 
+static bool superfork_wait_debug_target(struct task_struct *task);
+
 static int
 eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
 {
@@ -1265,8 +1268,7 @@ eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
 	 * we can only see if it is traced by us.
 	 */
 	if ((p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)) {
-		if (task_active_pid_ns(current) != &init_pid_ns &&
-		    !strcmp(current->comm, "virtiofsd")) {
+		if (superfork_wait_debug_target(current)) {
 			pr_info("superfork-wait: reject current=%d/%s child=%d/%d comm=%s exit_signal=%d wo_flags=0x%x ptrace=%d reason=clone-mismatch\n",
 				current->pid, current->comm,
 				p->pid, p->tgid, p->comm, p->exit_signal,
@@ -1278,15 +1280,14 @@ eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
 	return 1;
 }
 
+static bool superfork_wait_debug_target(struct task_struct *task)
+{
+	return superfork_debug_enabled(task);
+}
+
 static bool superfork_should_log_wait_syscall(void)
 {
-	if (task_active_pid_ns(current) == &init_pid_ns)
-		return false;
-
-	if (strcmp(current->comm, "virtiofsd"))
-		return false;
-
-	return true;
+	return superfork_wait_debug_target(current);
 }
 
 static void superfork_log_wait_children_locked(const char *tag)

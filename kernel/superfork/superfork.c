@@ -875,6 +875,7 @@ static void superfork_release_new_task(struct task_struct *p, bool post_fork_don
 {
 	if (!post_fork_done)
 		sched_cancel_fork(p);
+	superfork_debug_untrack_task(p);
 	superfork_release_placeholder_peers(p);
 	superfork_release_task_seccomp(p);
 	if (p->thread_pid)
@@ -889,6 +890,7 @@ static void superfork_discard_unattached_task(struct task_struct *p,
 	if (!p)
 		return;
 
+	superfork_debug_untrack_task(p);
 	superfork_release_placeholder_peers(p);
 	superfork_release_task_seccomp(p);
 	exit_thread(p);

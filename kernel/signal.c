@@ -38,6 +38,7 @@
 #include <linux/freezer.h>
 #include <linux/pid_namespace.h>
 #include <linux/nsproxy.h>
+#include <linux/superfork.h>
 #include <linux/user_namespace.h>
 #include <linux/uprobes.h>
 #include <linux/compat.h>
@@ -1180,13 +1181,6 @@ static inline bool has_si_pid_and_uid(struct kernel_siginfo *info)
 	return ret;
 }
 
-static bool superfork_signal_debug_target(struct task_struct *t)
-{
-	return !strcmp(t->comm, "containerd-shim") ||
-	       !strcmp(t->comm, "virtiofsd") ||
-	       !strcmp(t->comm, "qemu-system-x86");
-}
-
 static void superfork_log_signal_delivery(int sig, struct kernel_siginfo *info,
 					  struct task_struct *t,
 					  enum pid_type type, bool force,
@@ -1198,7 +1192,7 @@ static void superfork_log_signal_delivery(int sig, struct kernel_siginfo *info,
 	unsigned long logged_si_addr = 0;
 
 	if ((sig != SIGSEGV && sig != SIGBUS) ||
-	    !superfork_signal_debug_target(t))
+	    !superfork_debug_enabled(t))
 		return;
 
 	if (info == SEND_SIG_NOINFO) {
@@ -1364,7 +1358,7 @@ force_sig_info_to_task(struct kernel_siginfo *info, struct task_struct *t,
 	ignored = action->sa.sa_handler == SIG_IGN;
 	blocked = sigismember(&t->blocked, sig);
 	if (sig == SIGSEGV && info->si_code == SI_KERNEL &&
-	    superfork_signal_debug_target(t)) {
+	    superfork_debug_enabled(t)) {
 		pr_info("superfork-force-sig: target=%d/%s tgid=%d handler=%d blocked=%d ignored=%d current=%d/%s current_tgid=%d caller=%pS\n",
 			t->pid, t->comm, t->tgid, handler, blocked, ignored,
 			current->pid, current->comm, current->tgid, caller);

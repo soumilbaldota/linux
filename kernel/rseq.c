@@ -12,6 +12,7 @@
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/rseq.h>
+#include <linux/superfork.h>
 #include <linux/types.h>
 #include <linux/ratelimit.h>
 #include <asm/ptrace.h>
@@ -342,19 +343,11 @@ static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
 	return 0;
 }
 
-static bool superfork_rseq_debug_target(struct task_struct *t)
-{
-	return !strcmp(t->comm, "containerd-shim") ||
-	       !strncmp(t->comm, "virtiofsd", 9) ||
-	       !strncmp(t->comm, "qemu-system-x86", 15) ||
-	       !strcmp(t->comm, "vring_worker");
-}
-
 static void superfork_log_rseq_error(struct task_struct *t, const char *stage,
 				     int ret, struct pt_regs *regs,
 				     int sig, u64 rseq_cs_ptr)
 {
-	if (!superfork_rseq_debug_target(t))
+	if (!superfork_debug_enabled(t))
 		return;
 
 	pr_info("superfork-rseq: pid=%d comm=%s stage=%s ret=%d sig=%d rseq=%px rseq_len=%u rseq_sig=0x%x rseq_cs_ptr=0x%llx cpu_id=%d node_id=%d regs_ip=0x%lx regs_sp=0x%lx\n",

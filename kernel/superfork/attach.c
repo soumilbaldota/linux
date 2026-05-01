@@ -48,30 +48,6 @@ static struct task_struct *find_new_task_by_old(struct container_clone_ctx *ctx,
 static bool is_task_in_clone_set(struct container_clone_ctx *ctx,
 				 struct task_struct *task);
 
-static pid_t superfork_map_old_pid_to_new_nr(struct container_clone_ctx *ctx,
-					     pid_t old_pid,
-					     struct pid_namespace *old_ns,
-					     struct pid_namespace *ns)
-{
-	if (old_pid <= 0)
-		return 0;
-	if (!old_ns || !ns)
-		return 0;
-
-	for_each_task_in_ctx(ctx) {
-		struct task_clone_entry *task = get_ctx_task(ctx, i);
-
-		if (!task->old_task || !task->new_task)
-			continue;
-		if (task_pid_nr_ns(task->old_task, old_ns) != old_pid)
-			continue;
-
-		return task_pid_nr_ns(task->new_task, ns);
-	}
-
-	return 0;
-}
-
 static void superfork_remap_wait_syscall_args(struct container_clone_ctx *ctx,
 					      struct task_clone_entry *task)
 {
@@ -512,6 +488,17 @@ int superfork_attach_tasks(struct container_clone_ctx *ctx)
 
 	for_each_task_in_ctx(ctx)
 		superfork_remap_wait_syscall_args(ctx, get_ctx_task(ctx, i));
+
+	for_each_task_in_ctx(ctx) {
+		struct task_clone_entry *task = get_ctx_task(ctx, i);
+
+		if (!task->new_task)
+			continue;
+
+		ret = superfork_debug_track_task(task->new_task);
+		if (ret < 0)
+			return ret;
+	}
 
 	return 0;
 }
